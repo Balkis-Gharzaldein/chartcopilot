@@ -221,3 +221,118 @@ class TestRecommendationEngine:
         recs = recommend_charts(spec, profile)
         ids = [r.id for r in recs]
         assert len(ids) == len(set(ids))
+
+
+# --- analytical reasoning tests -----------------------------------------------
+
+class TestAnalyticalReasoning:
+    def test_id_column_forces_count_distinct(self):
+        """ID column should trigger count_distinct aggregation."""
+        profile = _make_profile(
+            row_count=100,
+            columns=[
+                {"name": "ID", "dtype": "object", "unique": 100, "samples": ["id1", "id2", "id3"]},
+                {"name": "Category", "dtype": "object", "unique": 5, "samples": ["A", "B", "C"]},
+            ],
+        )
+        spec = _make_spec(x="Category", y="ID", agg_function="count")
+        result = apply_rules(spec, profile)
+        assert result.spec.agg_function == "count_distinct"
+        assert any("identifier" in n.lower() or "count_distinct" in n.lower() for n in result.notes)
+
+    def test_comma_separated_values_suggests_split(self):
+        """Column with comma-separated values should suggest split."""
+        profile = _make_profile(
+            columns=[
+                {"name": "Tags", "dtype": "object", "unique": 10,
+                 "samples": ["tag1, tag2", "tag3", "tag4, tag5"]},
+                {"name": "Value", "dtype": "float64", "unique": 50, "samples": ["1.0", "2.0", "3.0"]},
+            ],
+        )
+        spec = _make_spec(x="Tags", y="Value")
+        result = apply_rules(spec, profile)
+        assert any("split" in n.lower() or "comma" in n.lower() for n in result.notes)
+
+    def test_top_n_auto_reduces(self):
+        """Top-N exceeding available data should auto-reduce."""
+        profile = _make_profile(
+            columns=[
+                {"name": "Cat", "dtype": "object", "unique": 5, "samples": ["A", "B", "C"]},
+                {"name": "Value", "dtype": "float64", "unique": 50, "samples": ["1.0", "2.0", "3.0"]},
+            ],
+        )
+        spec = _make_spec(x="Cat", data_notes="Show top 10 results only.")
+        result = apply_rules(spec, profile)
+        assert result.spec.data_notes is not None
+        assert "top 5" in result.spec.data_notes.lower() or "top 5" in " ".join(result.notes).lower()
+
+    def test_high_cardinality_id_detection(self):
+        """High-cardinality column (unique_count/row_count > 0.9) should be detected as ID."""
+        profile = _make_profile(
+            row_count=100,
+            columns=[
+                {"name": "UserID", "dtype": "object", "unique": 95, "samples": ["u1", "u2", "u3"]},
+                {"name": "Value", "dtype": "float64", "unique": 50, "samples": ["1.0", "2.0", "3.0"]},
+            ],
+        )
+        spec = _make_spec(x="UserID", y="Value", agg_function="count")
+        result = apply_rules(spec, profile)
+        assert result.spec.agg_function == "count_distinct"
+
+    def test_mecs_domain_rule_id_count(self):
+        """MECS domain: ID column with count aggregation should use count_distinct."""
+        profile = _make_profile(
+            row_count=1000,
+            columns=[
+                {"name": "ID", "dtype": "object", "unique": 1000, "samples": ["a1", "b2", "c3"]},
+                {"name": "Source", "dtype": "object", "unique": 10, "samples": ["Web", "Email"]},
+            ],
+        )
+        spec = _make_spec(x="Source", y="ID", agg_function="count")
+        result = apply_rules(spec, profile)
+        assert result.spec.agg_function == "count_distinct"
+
+
+# --- additional semantic validation tests -------------------------------------
+
+class TestSemanticValidationExtended:
+    def test_bar_sum_matches_source_count(self):
+        """Bar chart count should match source row count."""
+        spec = _make_spec(agg_function="count")
+        df = pd.DataFrame({"Category": ["A", "B", "C", "A"], "Value": [1, 2, 3, 4]})
+        result_df = pd.DataFrame({"Category": ["A", "B", "C"], "count": [2, 1, 1]})
+        result = validate_chart(spec, df, result_df, {"total": 4})
+        # Sum of bars (4) should match source rows (4)
+        assert not any("does not match" in w.lower() for w in result.warnings)
+
+    def test_bar_sum_mismatch_warning(self):
+        """Bar chart count that doesn't match source should warn."""
+        spec = _make_spec(agg_function="count")
+        df = pd.DataFrame({"Category": ["A", "B", "C", "A"], "Value": [1, 2, 3, 4]})
+        result_df = pd.DataFrame({"Category": ["A", "B"], "count": [2, 1]})  # missing C
+        result = validate_chart(spec, df, result_df, {"total": 4})
+        assert any("does not match" in w.lower() for w in result.warnings)
+
+    def test_pie_percentage_mismatch_warning(self):
+        """Pie chart where sum differs from total should warn."""
+        spec = _make_spec(chart_type="pie")
+        df = pd.DataFrame({"Category": ["A", "B"], "Value": [60, 30]})
+        result_df = pd.DataFrame({"Category": ["A", "B"], "Value": [60, 30]})
+        result = validate_chart(spec, df, result_df, {"total": 100})
+        assert any("differs" in w.lower() or "sum" in w.lower() for w in result.warnings)
+
+    def test_percentage_sum_warning(self):
+        """Values summing to non-100 percentage should warn."""
+        spec = _make_spec()
+        df = pd.DataFrame({"Category": ["A", "B", "C"], "pct": [40, 35, 20]})
+        result_df = pd.DataFrame({"Category": ["A", "B", "C"], "pct": [40, 35, 20]})
+        result = validate_chart(spec, df, result_df, {})
+        assert any("100%" in w for w in result.warnings)
+
+    def test_id_count_warning(self):
+        """Count on ID column should suggest count_distinct."""
+        spec = _make_spec(y="UserID", agg_function="count")
+        df = pd.DataFrame({"Category": ["A", "B"], "UserID": ["u1", "u2"]})
+        result_df = pd.DataFrame({"Category": ["A", "B"], "UserID": ["u1", "u2"]})
+        result = validate_chart(spec, df, result_df, {})
+        assert any("count_distinct" in w.lower() for w in result.warnings)
