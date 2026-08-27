@@ -193,6 +193,48 @@ def _summary_for_scatter(df, x, y) -> dict:
     }
 
 
+def _summary_for_map(df, x, y) -> dict:
+    """Summary for map charts: top regions by value."""
+    total = float(df[y].sum()) if y in df.columns else float(len(df))
+    top = df.nlargest(10, y)[[x, y]].to_dict(orient="records") if y in df.columns else []
+    top = [{"region": str(r[x]), "value": round(float(r[y]), 2)} for r in top]
+    return {
+        "chart_type": "map",
+        "measure": y,
+        "grouped_by": x,
+        "total": round(total, 2),
+        "n_regions": int(len(df)),
+        "top_regions": top,
+    }
+
+
+# Country to ISO-3 code mapping for Plotly choropleth
+COUNTRY_TO_ISO3 = {
+    "usa": "USA", "us": "USA", "united states": "USA", "united states of america": "USA",
+    "uk": "GBR", "united kingdom": "GBR", "great britain": "GBR",
+    "canada": "CAN", "germany": "DEU", "france": "FRA", "china": "CHN",
+    "japan": "JPN", "india": "IND", "brazil": "BRA", "australia": "AUS",
+    "mexico": "MEX", "italy": "ITA", "spain": "ESP", "russia": "RUS",
+    "south korea": "KOR", "korea": "KOR", "nigeria": "NGA", "egypt": "EGY",
+    "south africa": "ZAF", "kenya": "KEN", "ethiopia": "ETH",
+    "uae": "ARE", "united arab emirates": "ARE", "saudi arabia": "SAU",
+    "qatar": "QAT", "kuwait": "KWT", "bahrain": "BHR", "oman": "OMN",
+    "jordan": "JOR", "lebanon": "LBN", "iraq": "IRQ", "syria": "SYR",
+    "palestine": "PSE", "yemen": "YEM", "libya": "LBY", "tunisia": "TUN",
+    "morocco": "MAR", "algeria": "DZA", "sudan": "SDN",
+    "turkey": "TUR", "turkiye": "TUR", "iran": "IRN", "pakistan": "PAK",
+    "bangladesh": "BGD", "vietnam": "VNM", "thailand": "THA",
+    "indonesia": "IDN", "philippines": "PHL", "malaysia": "MYS",
+    "singapore": "SGP", "new zealand": "NZL", "ireland": "IRL",
+    "netherlands": "NLD", "belgium": "BEL", "switzerland": "CHE",
+    "sweden": "SWE", "norway": "NOR", "denmark": "DNK", "finland": "FIN",
+    "poland": "POL", "czech republic": "CZE", "czechia": "CZE",
+    "austria": "AUT", "portugal": "PRT", "greece": "GRC",
+    "argentina": "ARG", "chile": "CHL", "colombia": "COL", "peru": "PER",
+    "israel": "ISR", "ukrain": "UKR", "ukraine": "UKR",
+}
+
+
 def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
     """Create (figure_json, computed_summary, adaptation_note) for a ChartSpec."""
     if df is None or df.empty:
@@ -289,6 +331,51 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
             computed_summary=_summary_for_scatter(d, x, y),
             figure_data=_rows(d),
             adaptation_note=None,
+        )
+
+    if spec.chart_type == "map":
+        # Map charts: choropleth or bar map for geography data
+        d = df.copy()
+        if x not in d.columns:
+            raise ChartBuildError(f"Map chart requires a geography column '{x}'.")
+        if y not in d.columns or y == x:
+            # No value column, just show counts
+            d = d[x].value_counts().reset_index()
+            d.columns = [x, "count"]
+            y = "count"
+
+        # Try to map region names to ISO-3 codes for choropleth
+        d["_iso3"] = d[x].astype(str).str.lower().str.strip().map(COUNTRY_TO_ISO3)
+        has_iso3 = d["_iso3"].notna().sum()
+
+        if has_iso3 > len(d) * 0.5:
+            # Enough ISO matches: use choropleth
+            d_valid = d.dropna(subset=["_iso3"])
+            fig = px.choropleth(
+                d_valid,
+                locations="_iso3",
+                color=y,
+                hover_name=x,
+                title=spec.title,
+                color_continuous_scale=px.colors.sequential.Blues,
+            )
+            fig.update_layout(
+                geo=dict(showframe=False, showcoastlines=True, projection_type="natural earth"),
+                coloraxis_colorbar_title=y,
+            )
+            adaptation.append(f"Choropleth map: {len(d_valid)}/{len(d)} regions matched to ISO codes.")
+        else:
+            # Not enough ISO matches: fall back to horizontal bar
+            adaptation.append("Geography names could not be mapped to country codes; using horizontal bar instead.")
+            ordered = d.sort_values(y, ascending=True)
+            fig = px.bar(ordered, x=y, y=x, orientation="h", title=spec.title)
+            fig.update_layout(xaxis_title=y, yaxis_title=x)
+
+        return BuiltChart(
+            figure_json=fig.to_json(),
+            computed_summary=_summary_for_map(d, x, y),
+            figure_data=_rows(d),
+            adaptation_note=" ".join(adaptation) or None,
         )
 
     raise ChartBuildError(f"Unsupported chart type: {spec.chart_type}.")
@@ -419,6 +506,23 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
             recomputed_corr is not None and expected_corr is not None
             and abs(recomputed_corr - float(expected_corr)) <= 0.001,
             recomputed_corr, expected_corr, tol=0.001,
+        )
+    elif spec.chart_type == "map":
+        # Map verification: recompute grouped counts/sums
+        g = raw_df.copy()
+        if agg == "count" or not y:
+            recomputed = g.groupby(x).size().reset_index(name="count")
+            value_col = "count"
+        else:
+            g[y] = pd.to_numeric(g[y], errors="coerce")
+            g = g.dropna(subset=[y])
+            recomputed = g.groupby(x, as_index=False)[y].sum()
+            value_col = y
+        total = float(recomputed[value_col].sum())
+        checks["total"] = cmp(abs(total - float(summary.get("total", 0))) <= 0.01, total, summary.get("total"))
+        checks["n_regions"] = cmp(
+            len(recomputed) == summary.get("n_regions", 0),
+            len(recomputed), summary.get("n_regions"),
         )
     else:
         return False, {"error": f"Verification not implemented for chart type: {spec.chart_type}"}

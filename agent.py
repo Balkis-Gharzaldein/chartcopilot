@@ -37,8 +37,9 @@ AGENT_SYSTEM_PROMPT = (
     "use nunique() for count-distinct, apply top-N limits). "
     "For a bar/pie chart produce one row per category with the aggregated value. "
     "For a line chart produce one row per time point (aggregated if needed). "
-    "For a scatter chart produce the raw x/y rows. Reply with JSON {\"code\": \"...\"} "
-    "containing only the snippet."
+    "For a scatter chart produce the raw x/y rows. "
+    "For a map chart produce one row per geography region with the aggregated value. "
+    "Reply with JSON {\"code\": \"...\"} containing only the snippet."
 )
 
 
@@ -111,6 +112,23 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
     if spec.chart_type == "scatter":
         xs, ys = x or cols[0], y or (cols[1] if len(cols) > 1 else cols[0])
         chunks.append(f"result = df[[{_fg(xs)}, {_fg(ys)}]].dropna()")
+        return "\n".join(chunks)
+
+    if spec.chart_type == "map":
+        # Map charts: group by geography column, aggregate value
+        xcol = x or cols[0]
+        if use_nunique and y and y in cols:
+            chunks.append(
+                f"result = df.groupby({_fg(xcol)})[{_fg(y)}].nunique().reset_index(name='count')"
+            )
+        elif agg == "count" or not y:
+            chunks.append(f"result = df.groupby({_fg(xcol)}).size().reset_index(name='count')")
+        else:
+            chunks.append(
+                f"result = df.groupby({_fg(xcol)})[[{_fg(y)}]].agg('{agg}').reset_index()"
+            )
+        # Sort by value for better map rendering
+        chunks.append(f"result = result.sort_values(result.columns[-1], ascending=False)")
         return "\n".join(chunks)
 
     if spec.chart_type == "line":
@@ -211,6 +229,10 @@ def _apply_edit(spec: ChartSpec, message: str, known_categories: list[str] | Non
         "horizontal bar": "horizontal_bar",
         "pie": "pie",
         "scatter": "scatter",
+        "map": "map",
+        "choropleth": "map",
+        "geographic": "map",
+        "geo": "map",
         "line": "line",
     }
     changed = None

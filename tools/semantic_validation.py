@@ -76,8 +76,8 @@ def validate_chart(
 
     # --- Check 3: Data exists after split/explode ---
     notes = (spec.data_notes or "").lower()
-    if "split" in notes or "explode" in notes:
-        _check_split_data(source_df, spec.x, result)
+    if ("split" in notes or "explode" in notes) and result_df is not None:
+        _check_split_data(source_df, spec.x, result_df, result)
 
     # --- Check 4: Line chart x-axis is time-ordered ---
     if spec.chart_type == "line":
@@ -173,14 +173,14 @@ def _check_bar_totals(
             )
 
 
-def _check_split_data(source_df: pd.DataFrame, x_col: str | None, result: ValidationResult):
+def _check_split_data(source_df: pd.DataFrame, x_col: str | None, result_df: pd.DataFrame | None, result: ValidationResult):
     """After split/explode, verify data still exists."""
-    if x_col and x_col in source_df.columns:
+    if x_col and x_col in source_df.columns and result_df is not None:
         sample = source_df[x_col].dropna().head(20)
         has_commas = sample.astype(str).str.contains(",").any()
         if has_commas:
             source_unique = source_df[x_col].nunique()
-            if len(result) <= source_unique:
+            if len(result_df) <= source_unique:
                 result.add_warning(
                     "Split/explode may not have expanded comma-separated values as expected."
                 )
