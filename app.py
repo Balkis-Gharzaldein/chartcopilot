@@ -223,15 +223,10 @@ for i, r in enumerate(results, start=1):
 
     # --- recommendations: related chart suggestions ---
     if r.recommendations:
-        with col.expander(f"Related charts ({len(r.recommendations)} suggestions)"):
+        with col.expander(f"Related chart suggestions ({len(r.recommendations)})"):
             for rec in r.recommendations:
-                st.markdown(f"**{rec.spec.title}** ({rec.spec.chart_type})")
-                if rec.figure_json:
-                    rec_fig = _to_fig(rec.figure_json)
-                    if rec_fig is not None:
-                        st.plotly_chart(rec_fig, use_container_width=True)
-                if rec.adaptation_note:
-                    st.caption(f"Note: {rec.adaptation_note}")
+                st.markdown(f"- **{rec.spec.chart_type}**: {rec.spec.title}")
+            st.caption("Use the chat below to change the chart type (e.g. 'make it a pie chart').")
 
 if skipped_text:
     with st.expander(f"Skipped during planning ({len(skipped_text)} — shown, not hidden)"):

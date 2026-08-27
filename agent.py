@@ -316,14 +316,10 @@ def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) 
         # --- semantic validation: verify result logic ---
         validation_result = validate_chart(spec, df, built_df, chart.computed_summary)
 
-        # --- recommendations: generate related chart suggestions ---
+        # --- recommendations: generate related chart specs (not executed yet) ---
         profile = workbook.profile_for(spec.sheet)
         rec_specs = recommend_charts(spec, profile)
-        recommendations: list[ChartResult] = []
-        for rec_spec in rec_specs[1:]:  # skip the first (it's the original)
-            rec_result = execute_spec(rec_spec, workbook, attempt_llm=attempt_llm)
-            if not rec_result.skipped:
-                recommendations.append(rec_result)
+        rec_results = [ChartResult(spec=rs) for rs in rec_specs[1:]]  # specs only, not executed
 
         return ChartResult(
             spec=spec,
@@ -333,7 +329,7 @@ def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) 
             adaptation_note=chart.adaptation_note,
             verified=verified,
             verification=verification,
-            recommendations=recommendations,
+            recommendations=rec_results,
             validation=validation_result.to_dict(),
         )
 
