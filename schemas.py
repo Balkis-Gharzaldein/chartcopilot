@@ -64,6 +64,8 @@ class ChartResult(BaseModel):
     adaptation_note: str | None = None  # e.g. "bucketed 400 categories into top 10 + other"
     verified: bool = False  # independent recomputation matched computed_summary
     verification: dict = Field(default_factory=dict)  # per-check results
+    recommendations: list["ChartResult"] = Field(default_factory=list)  # related chart suggestions
+    validation: dict = Field(default_factory=dict)  # semantic validation results
 
     @property
     def skipped(self) -> bool:

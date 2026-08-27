@@ -192,6 +192,16 @@ for i, r in enumerate(results, start=1):
         else:
             failed = r.verification.get("failed") or []
             col.warning(f"Verification failed on: {', '.join(failed)}")
+
+    # --- semantic validation results ---
+    if r.validation:
+        val_warnings = r.validation.get("warnings", [])
+        val_errors = r.validation.get("errors", [])
+        if val_errors:
+            col.warning(f"Semantic validation: {', '.join(val_errors)}")
+        if val_warnings:
+            for w in val_warnings:
+                col.caption(f"Validation note: {w}")
     with col.expander("Chart data (rows used)"):
         if r.figure_data:
             st.dataframe(pd.DataFrame(r.figure_data), use_container_width=True)
@@ -210,6 +220,18 @@ for i, r in enumerate(results, start=1):
             if label:
                 st.write(label)
         st.json(summary)
+
+    # --- recommendations: related chart suggestions ---
+    if r.recommendations:
+        with col.expander(f"Related charts ({len(r.recommendations)} suggestions)"):
+            for rec in r.recommendations:
+                st.markdown(f"**{rec.spec.title}** ({rec.spec.chart_type})")
+                if rec.figure_json:
+                    rec_fig = _to_fig(rec.figure_json)
+                    if rec_fig is not None:
+                        st.plotly_chart(rec_fig, use_container_width=True)
+                if rec.adaptation_note:
+                    st.caption(f"Note: {rec.adaptation_note}")
 
 if skipped_text:
     with st.expander(f"Skipped during planning ({len(skipped_text)} — shown, not hidden)"):

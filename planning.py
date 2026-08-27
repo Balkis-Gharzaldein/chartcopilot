@@ -14,6 +14,7 @@ from typing import Sequence
 
 from llm import LLMError, llm_structured
 from schemas import ChartSpec, ChartSpecList, SheetProfile
+from tools.rule_engine import apply_rules
 
 PLAN_SYSTEM_PROMPT = (
     "You turn a data analyst's plain-English visualization guideline into structured chart "
@@ -661,20 +662,83 @@ def deterministic_plan(profiles: list[SheetProfile], lines: Sequence[str]) -> li
                 x_col, y_col = cat_col, measure
 
         title = re.sub(r"\s+", " ", title_line).strip()[:90] or f"Chart {idx}"
-        specs.append(
-            ChartSpec(
-                id=f"spec_{idx}",
-                sheet=prof.sheet_name,
-                chart_type=ctype,
-                title=title,
-                x=x_col,
-                y=y_col,
-                agg_function=agg,
-                data_notes=data_notes,
-                status="planned",
-            )
+        spec = ChartSpec(
+            id=f"spec_{idx}",
+            sheet=prof.sheet_name,
+            chart_type=ctype,
+            title=title,
+            x=x_col,
+            y=y_col,
+            agg_function=agg,
+            data_notes=data_notes,
+            status="planned",
         )
+        # Apply data-to-viz rules (long labels, many categories, time axis, etc.)
+        rule_result = apply_rules(spec, prof)
+        specs.append(rule_result.spec)
     return specs
+
+
+# --- recommendation engine ---------------------------------------------------
+
+def _count_categories_for_recommend(x_col: str | None, profile: SheetProfile) -> int | None:
+    """Count distinct values in x column for recommendation logic."""
+    if not x_col:
+        return None
+    for col in profile.columns:
+        if col.name == x_col:
+            return col.unique_count if col.unique_count > 0 else None
+    return None
+
+
+def recommend_charts(spec: ChartSpec, profile: SheetProfile) -> list[ChartSpec]:
+    """From one spec, generate primary + recommended charts.
+
+    Recommendations are alternative views the user might find useful:
+    - Bar with few categories → suggest pie (part-of-whole view)
+    - Bar with many categories → suggest horizontal_bar (ranking view)
+    - Pie → suggest bar (better for comparison)
+    - Line with single series → suggest bar (category comparison)
+
+    Returns a list where the first element is always the original spec.
+    """
+    recommendations: list[ChartSpec] = [spec]
+    n_categories = _count_categories_for_recommend(spec.x, profile)
+
+    # Rule 1: Bar with 2-8 categories → suggest pie
+    if spec.chart_type == "bar" and n_categories and 2 <= n_categories <= 8:
+        rec = spec.model_copy(deep=True)
+        rec.chart_type = "pie"
+        rec.title = f"Share of {spec.x}" if spec.x else f"{spec.title} (pie)"
+        rec.id = spec.id + "_rec_pie"
+        recommendations.append(rec)
+
+    # Rule 2: Bar with >10 categories → suggest horizontal_bar
+    if spec.chart_type == "bar" and n_categories and n_categories > 10:
+        rec = spec.model_copy(deep=True)
+        rec.chart_type = "horizontal_bar"
+        rec.title = f"Rank {spec.x}" if spec.x else f"{spec.title} (ranked)"
+        rec.id = spec.id + "_rec_hbar"
+        recommendations.append(rec)
+
+    # Rule 3: Pie → suggest bar (better for comparison)
+    if spec.chart_type == "pie":
+        rec = spec.model_copy(deep=True)
+        rec.chart_type = "bar"
+        rec.title = f"Compare by {spec.x}" if spec.x else f"{spec.title} (bar)"
+        rec.id = spec.id + "_rec_bar"
+        recommendations.append(rec)
+
+    # Rule 4: Horizontal bar → suggest lollipop (cleaner alternative)
+    if spec.chart_type == "horizontal_bar" and n_categories and n_categories > 5:
+        rec = spec.model_copy(deep=True)
+        rec.title = f"{spec.title} (lollipop)"
+        rec.id = spec.id + "_rec_lollipop"
+        # Lollipop is rendered as horizontal_bar with a flag
+        rec.data_notes = (rec.data_notes or "") + " Render as lollipop chart."
+        recommendations.append(rec)
+
+    return recommendations
 
 
 # --- LLM path ----------------------------------------------------------------

@@ -17,9 +17,11 @@ from pydantic import BaseModel
 
 from ingestion import Workbook
 from llm import LLMError, llm_structured
+from planning import recommend_charts
 from schemas import ChartResult, ChartSpec, SheetProfile
 from tools import create_chart, inspect_data, run_code
 from tools.create_chart import ChartBuildError
+from tools.semantic_validation import validate_chart
 
 MAX_ATTEMPTS = 2
 
@@ -310,6 +312,19 @@ def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) 
 
         # --- verify: independent closed-form recomputation against the raw frame
         verified, verification = create_chart.verify_computed(spec, df, chart.computed_summary)
+
+        # --- semantic validation: verify result logic ---
+        validation_result = validate_chart(spec, df, built_df, chart.computed_summary)
+
+        # --- recommendations: generate related chart suggestions ---
+        profile = workbook.profile_for(spec.sheet)
+        rec_specs = recommend_charts(spec, profile)
+        recommendations: list[ChartResult] = []
+        for rec_spec in rec_specs[1:]:  # skip the first (it's the original)
+            rec_result = execute_spec(rec_spec, workbook, attempt_llm=attempt_llm)
+            if not rec_result.skipped:
+                recommendations.append(rec_result)
+
         return ChartResult(
             spec=spec,
             figure_json=chart.figure_json,
@@ -318,6 +333,8 @@ def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) 
             adaptation_note=chart.adaptation_note,
             verified=verified,
             verification=verification,
+            recommendations=recommendations,
+            validation=validation_result.to_dict(),
         )
 
     note = last_error or "Unknown execution error."

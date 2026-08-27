@@ -147,7 +147,7 @@ python -m pytest tests/ -v
 chartcopilot/
 ├── app.py                  # Streamlit entrypoint (upload, run, dashboard, chat)
 ├── agent.py                # ReAct tool loop + codegen (LLM & deterministic)
-├── planning.py             # Guideline → ChartSpec (LLM & deterministic)
+├── planning.py             # Guideline → ChartSpec + recommendations (LLM & deterministic)
 ├── schemas.py              # Pydantic v2 models
 ├── ingestion.py            # Excel/CSV parsing, header detection, profiling
 ├── guideline.py            # Instructions sheet / text area extraction
@@ -157,10 +157,13 @@ chartcopilot/
 │   ├── inspect_data.py     # Schema inspection (never raw data)
 │   ├── run_code.py         # Sandboxed pandas execution
 │   ├── sandbox_worker.py   # Persistent sandbox subprocess
-│   └── create_chart.py     # Plotly chart building + adaptation
+│   ├── create_chart.py     # Plotly chart building + adaptation
+│   ├── rule_engine.py      # Data-to-viz rules for chart type selection
+│   └── semantic_validation.py  # Result logic verification
 ├── tests/
 │   ├── test_pipeline.py    # Full acceptance tests
-│   └── test_run_code.py    # Sandbox isolation tests
+│   ├── test_run_code.py    # Sandbox isolation tests
+│   └── test_rules.py       # Rule engine + validation + recommendations
 ├── sample_data/            # Example datasets
 ├── requirements.txt        # Python dependencies
 ├── Dockerfile              # Container packaging
@@ -194,6 +197,45 @@ Two modes for generating pandas snippets:
 ### Verification
 
 After each chart is built, `verify_computed` independently recomputes the headline numbers from the raw data and compares them with the chart's `computed_summary`. This catches mismatches between what the codegen produced and what the data actually says.
+
+### Rule-Based Engine
+
+Rules extracted from [data-to-viz.com](https://www.data-to-viz.com/) are applied after line grouping, before chart type finalization:
+
+| Rule | Trigger | Action |
+|------|---------|--------|
+| Long labels | Category labels > 12 chars avg | Switch to `horizontal_bar` |
+| Many categories | > 10 categories | Switch to `horizontal_bar` |
+| Time axis | x-column is date/time | Switch to `line` |
+| Pie overload | Pie with > 6 categories | Add warning note |
+| Spaghetti risk | Line with > 5 groups | Add clutter warning |
+| Ranking intent | "rank", "top", "highest" in line | Force `horizontal_bar` |
+
+User-explicit requests always override rules.
+
+### Semantic Validation
+
+After chart building, results are validated for logical correctness:
+
+- **Pie sums**: Values should represent parts of a whole
+- **Bar consistency**: Negative values flagged
+- **Split/explode**: Data exists after comma-separated expansion
+- **Line ordering**: Time axis is properly sorted
+- **Scatter axes**: Both x and y are numeric
+- **Top-N bounds**: Requested N doesn't exceed available data
+
+### Recommendation Engine
+
+Each chart can generate related suggestions:
+
+| Primary Chart | Recommendation | Why |
+|---------------|----------------|-----|
+| Bar (2-8 cats) | Pie | Part-of-whole view |
+| Bar (>10 cats) | Horizontal bar | Better ranking view |
+| Pie | Bar | Better for comparison |
+| Horizontal bar (>5 cats) | Lollipop | Cleaner alternative |
+
+Recommendations appear as expandable sections under each main chart.
 
 ## Known Limitations
 
