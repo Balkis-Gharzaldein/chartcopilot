@@ -204,4 +204,4 @@ After each chart is built, `verify_computed` independently recomputes the headli
 
 ## License
 
-Internal project — MECS Internship 2026.
+MIT — see [LICENSE](LICENSE) for details.
