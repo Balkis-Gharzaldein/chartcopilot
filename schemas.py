@@ -6,14 +6,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-ChartType = Literal["line", "bar", "horizontal_bar", "pie", "scatter", "map"]
+ChartType = Literal["line", "bar", "horizontal_bar", "pie", "scatter"]
 PlotlyChartType = Literal[
     "line",
     "bar",
     "horizontal_bar",
     "pie",
     "scatter",
-    "map",
 ]
 
 
@@ -37,7 +36,7 @@ class SheetProfile(BaseModel):
 class ChartSpec(BaseModel):
     id: str
     sheet: str
-    chart_type: Literal["line", "bar", "horizontal_bar", "pie", "scatter", "map"]
+    chart_type: Literal["line", "bar", "horizontal_bar", "pie", "scatter"]
     title: str
     x: str | None
     y: str | None

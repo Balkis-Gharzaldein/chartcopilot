@@ -47,7 +47,8 @@ SYNONYMS: dict[str, set[str]] = {
     "margin": {"margin", "profit", "pct", "percentage", "rate"},
     "cost": {"cost", "cogs", "expense", "spend", "price", "purchase"},
     "date": {"date", "time", "year", "month", "day", "quarter", "week", "period", "timestamp"},
-    "region": {"region", "country", "state", "city", "territory", "location", "area", "zone", "geography", "geo", "nation", "province", "district"},
+    "region": {"region", "country", "state", "city", "territory", "location", "area", "zone", "nation", "province", "district"},
+    "geography": {"geography", "geo"},
     "product": {"product", "item", "sku", "sku_id", "category", "name", "title", "variant"},
     "customer": {"customer", "client", "buyer", "account", "user"},
 }
@@ -58,7 +59,6 @@ CHART_KEYWORDS = {
     "pie": {"pie chart", "pie", "donut", "share of", "distribution by", "breakdown by", "proportion", "slice"},
     "scatter": {"scatter", "correlation", "relationship", "vs ", "versus", "plot of", "scatter plot"},
     "bar": {"bar chart", "bar graph", "column chart", "comparison", "bar"},
-    "map": {"map", "geographic", "geo", "choropleth", "heat map", "on map", "by country", "by region", "by state", "by city", "by geography"},
 }
 
 AGG_KEYWORDS = {
@@ -128,15 +128,13 @@ def _pick_best_column(line: str, profile: SheetProfile) -> tuple[str, float] | N
 
 def _detect_chart_type(line: str, x_col: str | None) -> str:
     norm = _norm(line)
-    for ctype in ("map", "horizontal_bar", "pie", "line", "scatter", "bar"):
+    for ctype in ("horizontal_bar", "pie", "line", "scatter", "bar"):
         for kw in CHART_KEYWORDS[ctype]:
             if kw in norm:
                 return ctype
-    # No explicit keyword: date-like x -> line, geography-like x -> map, otherwise bar.
+    # No explicit keyword: date-like x -> line, otherwise bar.
     if x_col and (_tokens(x_col) & SYNONYMS["date"]) or "trend" in line.lower() or "time" in line.lower():
         return "line"
-    if x_col and (_tokens(x_col) & SYNONYMS["region"]):
-        return "map"
     return "bar"
 
 
@@ -182,45 +180,6 @@ def _find_time_column(profile: SheetProfile) -> str | None:
         if overlap and overlap > best_score:
             best, best_score = col.name, overlap
     return best
-
-
-def _find_geography_column(profile: SheetProfile) -> str | None:
-    """A column whose tokens look like a geography/location axis."""
-    geo_syns = SYNONYMS["region"]
-    best, best_score = None, 0.0
-    for col in profile.columns:
-        toks = _tokens(col.name)
-        overlap = len(toks & geo_syns)
-        if overlap and overlap > best_score:
-            best, best_score = col.name, overlap
-    return best
-
-
-def _is_geography_column(col_name: str, profile: SheetProfile) -> bool:
-    """Check if a column contains geographic data."""
-    geo_syns = SYNONYMS["region"]
-    # Check column name
-    toks = _tokens(col_name)
-    if toks & geo_syns:
-        return True
-    # Check sample values for country/state patterns
-    for col in profile.columns:
-        if col.name == col_name and col.sample_values:
-            for sv in col.sample_values[:5]:
-                sv_lower = str(sv).lower().strip()
-                # Check for common country names
-                common_countries = {
-                    "usa", "us", "united states", "uk", "united kingdom", "canada",
-                    "germany", "france", "china", "japan", "india", "brazil",
-                    "australia", "mexico", "italy", "spain", "russia", "korea",
-                    "nigeria", "egypt", "south africa", "kenya", "ethiopia",
-                    "uae", "saudi arabia", "qatar", "kuwait", "bahrain", "oman",
-                    "jordan", "lebanon", "iraq", "syria", "palestine", "yemen",
-                    "libya", "tunisia", "morocco", "algeria", "sudan",
-                }
-                if sv_lower in common_countries:
-                    return True
-    return False
 
 
 NUMERIC_DTYPES = {"int64", "int32", "float64", "float32", "Int64", "Float64"}
@@ -805,7 +764,7 @@ def _build_user_prompt(profiles: list[SheetProfile], lines: Sequence[str]) -> st
         f"{lines_txt}\n\n"
         "Return a JSON object: {\"specs\": [<ChartSpec>, ...]}. "
         "Use exactly the column names listed above. Chart types: line, bar, horizontal_bar, pie, "
-        "scatter, map. For skipped items set \"status\": \"skipped\" and explain skip_reason. "
+        "scatter. For skipped items set \"status\": \"skipped\" and explain skip_reason. "
         "Sets an appropriate agg_function (sum/mean/count/etc.). Do not reference an "
         "instructions/guideline sheet as data."
     )
