@@ -1,12 +1,40 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ChartResult } from '../lib/store'
 
 declare const Plotly: any
+
+function sanitizeFilename(title: string): string {
+  const base = title.trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9\-_]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '')
+  // Remove Windows invalid chars <>:"/\|?* and control
+  const cleaned = base.replace(/[<>:"/\\|?*\x00-\x1F]/g, '').slice(0, 80) || 'chart'
+  return cleaned
+}
+
+function downloadCSV(figureData: any[], filename: string) {
+  if (!figureData || figureData.length === 0) return
+  const cols = Object.keys(figureData[0])
+  const escape = (v: any) => {
+    const s = String(v ?? '')
+    if (s.includes('"') || s.includes(',') || s.includes('\n')) return '"' + s.replace(/"/g, '""') + '"'
+    return s
+  }
+  const rows = [cols.map(escape).join(',')].concat(figureData.map(r => cols.map(c => escape((r as any)[c])).join(',')))
+  const blob = new Blob([rows.join('\n')], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url) }, 0)
+}
 
 export function ChartCard({ result, onSelect, selected }: { result: ChartResult; onSelect: () => void; selected: boolean }) {
   const ref = useRef<HTMLDivElement>(null)
   const spec = result.spec
   const hasFigure = !!result.figure_json
+  const [ready, setReady] = useState(false)
+  const [menuOpen, setMenuOpen] = useState(false)
 
   useEffect(() => {
     if (!hasFigure || !ref.current || !result.figure_json) return
@@ -21,19 +49,18 @@ export function ChartCard({ result, onSelect, selected }: { result: ChartResult;
       paper_bgcolor: 'white',
       plot_bgcolor: 'white',
     }
-    // Use Plotly from CDN if available, otherwise fallback to div
+    // Use Plotly from CDN if available
     const PlotlyAny: any = (window as any).Plotly
     if (PlotlyAny?.newPlot) {
-      PlotlyAny.newPlot(ref.current, fig.data, fig.layout, { displayModeBar: false, responsive: true })
+      setReady(false)
+      PlotlyAny.newPlot(ref.current, fig.data, fig.layout, { displayModeBar: false, responsive: true }).then(() => setReady(true))
       const onResize = () => PlotlyAny.Plots.resize(ref.current)
       window.addEventListener('resize', onResize)
       return () => {
         window.removeEventListener('resize', onResize)
+        setReady(false)
         try { PlotlyAny.purge(ref.current) } catch {}
       }
-    } else {
-      // No Plotly yet — render placeholder and lazy load by injecting script once
-      // For now show JSON placeholder
     }
   }, [result.figure_json, hasFigure])
 
@@ -45,6 +72,39 @@ export function ChartCard({ result, onSelect, selected }: { result: ChartResult;
     s.async = true
     document.head.appendChild(s)
   }, [])
+
+  // Close menu on outside click
+  useEffect(() => {
+    if (!menuOpen) return
+    const onDoc = (e: MouseEvent) => {
+      const target = e.target as HTMLElement
+      if (!target.closest('[data-chart-menu]')) setMenuOpen(false)
+    }
+    document.addEventListener('click', onDoc)
+    return () => document.removeEventListener('click', onDoc)
+  }, [menuOpen])
+
+  const filenameBase = sanitizeFilename(spec.title)
+
+  const handleDownload = (format: 'png' | 'svg') => {
+    const gd: any = ref.current
+    const PlotlyAny: any = (window as any).Plotly
+    if (!gd || !PlotlyAny?.downloadImage) return
+    // Do not regenerate chart, reuse existing instance
+    PlotlyAny.downloadImage(gd, {
+      format,
+      width: 1600,
+      height: 900,
+      filename: filenameBase,
+      scale: 2,
+    }).catch(() => {})
+    setMenuOpen(false)
+  }
+
+  const handleCSV = () => {
+    downloadCSV(result.figure_data || [], `${filenameBase}.csv`)
+    setMenuOpen(false)
+  }
 
   return (
     <div
@@ -64,6 +124,43 @@ export function ChartCard({ result, onSelect, selected }: { result: ChartResult;
           ) : result.verification && Object.keys(result.verification).length > 0 ? (
             <span className="text-[11px] px-2 py-1 rounded-full bg-amber-50 text-amber-700 border border-amber-200">Needs check</span>
           ) : null}
+          {hasFigure && spec.status !== 'skipped' && (
+            <div className="relative" data-chart-menu onClick={e => e.stopPropagation()}>
+              <button
+                onClick={() => setMenuOpen(v => !v)}
+                className="h-7 w-7 rounded-full hover:bg-white border border-transparent hover:border-zinc-200 flex items-center justify-center text-zinc-600"
+                aria-label="Chart actions"
+                title="Download"
+              >
+                ⋯
+              </button>
+              {menuOpen && (
+                <div className="absolute right-0 top-8 w-44 bg-white border border-zinc-200 rounded-xl shadow-lg py-1 z-20">
+                  <button
+                    onClick={() => handleDownload('png')}
+                    disabled={!ready}
+                    className="w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Download PNG
+                  </button>
+                  <button
+                    onClick={() => handleDownload('svg')}
+                    disabled={!ready}
+                    className="w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Download SVG
+                  </button>
+                  <button
+                    onClick={handleCSV}
+                    disabled={!result.figure_data || result.figure_data.length === 0}
+                    className="w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Download CSV
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
 

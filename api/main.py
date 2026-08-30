@@ -34,8 +34,6 @@ from narrative import synthesize_narrative
 from planning import plan_charts
 from schemas import ChartResult, ChartSpec, SheetProfile
 
-MAX_FILE_MB = 20
-
 app = FastAPI(
     title="ChartCopilot API",
     version="1.0.0",
@@ -155,8 +153,6 @@ async def create_workbook(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided.")
     data = await file.read()
-    if len(data) > MAX_FILE_MB * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"File too large (max {MAX_FILE_MB} MB).")
     if len(data) == 0:
         raise HTTPException(status_code=400, detail="Empty file.")
     try:

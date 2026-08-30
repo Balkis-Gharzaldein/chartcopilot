@@ -17,6 +17,14 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 from schemas import ChartSpec
+from tools.chart_theme import (
+    CATEGORICAL,
+    DIVERGING_SCALE,
+    PRIMARY,
+    SEQUENTIAL_SCALE,
+    apply_base_layout,
+    get_categorical,
+)
 
 MAX_CATEGORIES = 10
 
@@ -295,8 +303,22 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
             if (bucketed[y] < 0).any():
                 raise ChartBuildError("Pie/donut requires non-negative values.")
             hole = 0.45 if spec.chart_type == "donut" else 0
-            fig = px.pie(bucketed, names=x, values=y, title=spec.title, hole=hole)
-            fig.update_traces(textposition="inside", textinfo="percent+label")
+            fig = px.pie(
+                bucketed,
+                names=x,
+                values=y,
+                title=spec.title,
+                hole=hole,
+                color_discrete_sequence=CATEGORICAL,
+            )
+            fig.update_traces(
+                textposition="inside",
+                textinfo="percent+label",
+                textfont=dict(size=11, color="#2B2D42"),
+                marker=dict(line=dict(color="#FFFFFF", width=2)),
+                hoverlabel=dict(bgcolor="white", font_size=11),
+            )
+            apply_base_layout(fig, title=spec.title)
             return BuiltChart(
                 figure_json=fig.to_json(),
                 computed_summary=_summary_for_categorical(x, y, bucketed, spec.agg_function or "sum"),
@@ -306,35 +328,72 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
 
         if spec.chart_type == "horizontal_bar":
             ordered = bucketed.sort_values(y, ascending=True)
-            fig = px.bar(ordered, x=y, y=x, orientation="h", title=spec.title)
+            fig = px.bar(
+                ordered,
+                x=y,
+                y=x,
+                orientation="h",
+                title=spec.title,
+                color_discrete_sequence=[PRIMARY],
+            )
+            fig.update_traces(
+                marker=dict(color=PRIMARY, line=dict(color="#FFFFFF", width=1)),
+                hoverlabel=dict(bgcolor="white", font_size=11),
+            )
             fig.update_layout(xaxis_title=y, yaxis_title=x)
+            apply_base_layout(fig, title=spec.title)
         elif spec.chart_type in ("grouped_bar", "stacked_bar", "stacked_100"):
-            # For these, df is expected to have x, group_by, y. If bucketed is single-group aggregated, we need to use original df with group_by
-            # Fallback: if df has group_by, use grouped data; otherwise treat as bar
             if spec.group_by and spec.group_by in df.columns and y in df.columns:
-                # Re-aggregate with group_by if not already
-                # Use the computed df which should already be grouped by (x, group_by) from codegen
-                # For display, use bucketed if available else df
                 use_df = bucketed if len(bucketed) <= len(df) else df
-                # If stacked_100, normalize
                 if spec.chart_type == "stacked_100":
-                    # Normalize y to percent per x
                     tmp = use_df.copy()
-                    # Need to pivot normalize: compute total per x
                     totals = tmp.groupby(x)[y].transform("sum")
                     tmp[y] = tmp[y] / totals * 100
                     use_df = tmp
-                    fig = px.bar(use_df, x=x, y=y, color=spec.group_by, title=spec.title, barmode="stack")
+                    fig = px.bar(
+                        use_df,
+                        x=x,
+                        y=y,
+                        color=spec.group_by,
+                        title=spec.title,
+                        barmode="stack",
+                        color_discrete_sequence=CATEGORICAL,
+                    )
                 elif spec.chart_type == "grouped_bar":
-                    fig = px.bar(use_df, x=x, y=y, color=spec.group_by, title=spec.title, barmode="group")
+                    fig = px.bar(
+                        use_df,
+                        x=x,
+                        y=y,
+                        color=spec.group_by,
+                        title=spec.title,
+                        barmode="group",
+                        color_discrete_sequence=CATEGORICAL,
+                    )
                 else:
-                    fig = px.bar(use_df, x=x, y=y, color=spec.group_by, title=spec.title, barmode="stack")
+                    fig = px.bar(
+                        use_df,
+                        x=x,
+                        y=y,
+                        color=spec.group_by,
+                        title=spec.title,
+                        barmode="stack",
+                        color_discrete_sequence=CATEGORICAL,
+                    )
             else:
-                fig = px.bar(bucketed, x=x, y=y, title=spec.title)
+                fig = px.bar(bucketed, x=x, y=y, title=spec.title, color_discrete_sequence=[PRIMARY])
+                fig.update_traces(marker=dict(color=PRIMARY, line=dict(color="#FFFFFF", width=1)))
             fig.update_layout(xaxis_title=x, yaxis_title=y)
+            apply_base_layout(fig, title=spec.title)
         else:
-            fig = px.bar(bucketed, x=x, y=y, title=spec.title)
+            fig = px.bar(bucketed, x=x, y=y, title=spec.title, color_discrete_sequence=[PRIMARY])
+            fig.update_traces(
+                marker=dict(color=PRIMARY, line=dict(color="#FFFFFF", width=1)),
+                hoverlabel=dict(bgcolor="white", font_size=11),
+            )
             fig.update_layout(xaxis_title=x, yaxis_title=y)
+            apply_base_layout(fig, title=spec.title)
+        # Apply subtle bar styling
+        fig.update_traces(marker_line_width=1, marker_line_color="white", opacity=0.96)
         return BuiltChart(
             figure_json=fig.to_json(),
             computed_summary=_summary_for_categorical(x, y, bucketed, spec.agg_function or "sum"),
@@ -348,15 +407,48 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
         d = df.sort_values(x)
         if spec.group_by and spec.group_by in d.columns:
             if spec.chart_type == "area":
-                fig = px.area(d, x=x, y=y, color=spec.group_by, title=spec.title)
+                fig = px.area(
+                    d,
+                    x=x,
+                    y=y,
+                    color=spec.group_by,
+                    title=spec.title,
+                    color_discrete_sequence=CATEGORICAL,
+                )
             else:
-                fig = px.line(d, x=x, y=y, color=spec.group_by, title=spec.title)
+                fig = px.line(
+                    d,
+                    x=x,
+                    y=y,
+                    color=spec.group_by,
+                    title=spec.title,
+                    color_discrete_sequence=CATEGORICAL,
+                )
+            fig.update_traces(line=dict(width=2.2), marker=dict(size=5, line=dict(width=1, color="white")))
         else:
             if spec.chart_type == "area":
-                fig = px.area(d, x=x, y=y, title=spec.title)
+                fig = px.area(d, x=x, y=y, title=spec.title, color_discrete_sequence=[PRIMARY])
+                fig.update_traces(
+                    line=dict(color=PRIMARY, width=2.2),
+                    fillcolor="rgba(154,140,180,0.22)",
+                    marker=dict(size=5, color=PRIMARY, line=dict(width=1, color="white")),
+                )
             else:
-                fig = go.Figure(go.Scatter(x=d[x], y=_to_numeric(d[y]), mode="lines+markers", name=y))
+                fig = go.Figure(
+                    go.Scatter(
+                        x=d[x],
+                        y=_to_numeric(d[y]),
+                        mode="lines+markers",
+                        name=y,
+                        line=dict(color=PRIMARY, width=2.4),
+                        marker=dict(color=PRIMARY, size=6, line=dict(width=1, color="white")),
+                        hoverlabel=dict(bgcolor="white"),
+                    )
+                )
                 fig.update_layout(title=spec.title, xaxis_title=x, yaxis_title=y)
+        apply_base_layout(fig, title=spec.title)
+        # Soften line markers
+        fig.update_layout(hovermode="x unified")
         return BuiltChart(
             figure_json=fig.to_json(),
             computed_summary=_summary_for_line(d, x, y),
@@ -368,8 +460,19 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
         col = x if x in df.columns else y
         if col not in df.columns:
             raise ChartBuildError(f"Histogram requires column '{col}'")
-        fig = px.histogram(df, x=col, title=spec.title)
-        fig.update_layout(xaxis_title=col, yaxis_title="count")
+        fig = px.histogram(
+            df,
+            x=col,
+            title=spec.title,
+            color_discrete_sequence=[PRIMARY],
+        )
+        fig.update_traces(
+            marker=dict(color=PRIMARY, line=dict(color="white", width=1)),
+            opacity=0.92,
+            hoverlabel=dict(bgcolor="white"),
+        )
+        fig.update_layout(xaxis_title=col, yaxis_title="count", bargap=0.08)
+        apply_base_layout(fig, title=spec.title)
         return BuiltChart(
             figure_json=fig.to_json(),
             computed_summary=_summary_for_histogram(df, col),
@@ -378,15 +481,29 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
         )
 
     if spec.chart_type == "boxplot":
-        # y is numeric measure, x optional categorical
         ycol = y if y in df.columns else x
         xcol = spec.x if spec.x in df.columns and spec.x != ycol else None
         if ycol not in df.columns:
             raise ChartBuildError(f"Box plot requires numeric '{ycol}'")
         if xcol and xcol in df.columns:
-            fig = px.box(df, x=xcol, y=ycol, title=spec.title)
+            fig = px.box(
+                df,
+                x=xcol,
+                y=ycol,
+                title=spec.title,
+                color=xcol,
+                color_discrete_sequence=CATEGORICAL,
+            )
         else:
-            fig = px.box(df, y=ycol, title=spec.title)
+            fig = px.box(df, y=ycol, title=spec.title, color_discrete_sequence=[PRIMARY])
+            fig.update_traces(marker=dict(color=PRIMARY), line=dict(color=PRIMARY))
+        fig.update_traces(
+            boxmean=False,
+            jitter=0.12,
+            marker=dict(line=dict(width=1, color="white"), opacity=0.9),
+            line=dict(width=1.4),
+        )
+        apply_base_layout(fig, title=spec.title)
         return BuiltChart(
             figure_json=fig.to_json(),
             computed_summary=_summary_for_box(df, xcol, ycol),
@@ -395,14 +512,25 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
         )
 
     if spec.chart_type == "heatmap":
-        # Expect df to be correlation matrix or raw numeric df; if raw, compute corr
         numeric_df = df.select_dtypes(include=["number"])
         if numeric_df.empty:
-            # Try to pick numeric cols from original
             raise ChartBuildError("Heatmap requires numeric data")
         corr = numeric_df.corr(numeric_only=True)
-        fig = px.imshow(corr, text_auto=True, aspect="auto", title=spec.title, color_continuous_scale="RdBu", zmin=-1, zmax=1)
-        # Convert corr to rows for figure_data
+        fig = px.imshow(
+            corr,
+            text_auto=".2f",
+            aspect="auto",
+            title=spec.title,
+            color_continuous_scale=DIVERGING_SCALE,
+            zmin=-1,
+            zmax=1,
+        )
+        fig.update_traces(
+            hoverlabel=dict(bgcolor="white", font_size=11),
+            textfont=dict(size=10, color="#2B2D42"),
+        )
+        fig.update_layout(coloraxis_colorbar=dict(title="corr", tickfont=dict(size=10)))
+        apply_base_layout(fig, title=spec.title)
         corr_reset = corr.reset_index()
         return BuiltChart(
             figure_json=fig.to_json(),
@@ -415,7 +543,28 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
         d = df.dropna(subset=[x, y])
         if not spec.y or spec.y not in d.columns or not spec.x or spec.x not in d.columns:
             raise ChartBuildError("Scatter chart requires both x and y columns.")
-        fig = px.scatter(d, x=spec.x, y=spec.y, title=spec.title)
+        if spec.group_by and spec.group_by in d.columns:
+            fig = px.scatter(
+                d,
+                x=spec.x,
+                y=spec.y,
+                color=spec.group_by,
+                title=spec.title,
+                color_discrete_sequence=CATEGORICAL,
+            )
+        else:
+            fig = px.scatter(
+                d,
+                x=spec.x,
+                y=spec.y,
+                title=spec.title,
+                color_discrete_sequence=[PRIMARY],
+            )
+        fig.update_traces(
+            marker=dict(size=6, opacity=0.82, line=dict(width=1, color="white")),
+            hoverlabel=dict(bgcolor="white"),
+        )
+        apply_base_layout(fig, title=spec.title)
         return BuiltChart(
             figure_json=fig.to_json(),
             computed_summary=_summary_for_scatter(d, x, y),

@@ -23,9 +23,6 @@ from ingestion import ingest_file
 from narrative import synthesize_narrative
 from planning import plan_charts
 
-MAX_FILE_MB = 20
-
-
 def _to_fig(figure_json: str):
     try:
         return pio.from_json(figure_json)
@@ -57,10 +54,6 @@ if not _has_llm():
 uploaded = st.file_uploader("Upload an Excel file", type=["xlsx", "xls", "csv"])
 
 if uploaded is None:
-    st.stop()
-
-if uploaded.size > MAX_FILE_MB * 1024 * 1024:
-    st.error(f"File is too large (max {MAX_FILE_MB} MB).")
     st.stop()
 
 

@@ -14,7 +14,12 @@ export function UploadModal({ open, onClose }: { open: boolean; onClose: () => v
   async function handleFile(f: File | null) {
     if (!f) return
     setError(null)
-    if (f.size > 20 * 1024 * 1024) { setError('File too large (max 20 MB).'); return }
+    // No hardcoded file-size limit — accept any size, backend will handle parsing
+    // Keep file-type validation via input accept + backend error handling
+    if (!f.name.match(/\.(xlsx|xls|csv)$/i)) {
+      setError('Please upload an Excel (.xlsx, .xls) or CSV file.')
+      return
+    }
     setLoading(true)
     try {
       const res = await api.upload(f)
@@ -42,7 +47,7 @@ export function UploadModal({ open, onClose }: { open: boolean; onClose: () => v
         >
           <div className="mx-auto h-10 w-10 rounded-full bg-zinc-900 text-white flex items-center justify-center mb-3">↑</div>
           <p className="text-sm font-medium">Drop Excel or CSV here, or click to browse</p>
-          <p className="text-xs text-zinc-500 mt-1">.xlsx, .xls, .csv — up to 20 MB</p>
+          <p className="text-xs text-zinc-500 mt-1">.xlsx, .xls, .csv</p>
           <input ref={inputRef} type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={e => handleFile(e.target.files?.[0] || null)} />
         </div>
         {error && <div className="mt-3 text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</div>}
