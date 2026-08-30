@@ -20,7 +20,7 @@ from schemas import ChartSpec
 
 MAX_CATEGORIES = 10
 
-CHARTS_WITH_CATEGORIES = {"pie", "bar", "horizontal_bar"}
+CHARTS_WITH_CATEGORIES = {"pie", "donut", "bar", "horizontal_bar", "grouped_bar", "stacked_bar", "stacked_100"}
 
 
 class ChartBuildError(RuntimeError):
@@ -193,6 +193,60 @@ def _summary_for_scatter(df, x, y) -> dict:
     }
 
 
+def _summary_for_histogram(df, x) -> dict:
+    vals = _to_numeric(df[x])
+    vals = vals.dropna()
+    return {
+        "chart_type": "histogram",
+        "measure": x,
+        "grouped_by": x,
+        "count": int(len(vals)),
+        "mean": round(float(vals.mean()), 2) if len(vals) else None,
+        "median": round(float(vals.median()), 2) if len(vals) else None,
+        "std": round(float(vals.std()), 2) if len(vals) > 1 else None,
+        "min": round(float(vals.min()), 2) if len(vals) else None,
+        "max": round(float(vals.max()), 2) if len(vals) else None,
+    }
+
+
+def _summary_for_box(df, x, y) -> dict:
+    # x categorical group, y numeric; or y is numeric alone
+    if y and y in df.columns:
+        vals = _to_numeric(df[y]).dropna()
+        groups = df[x].nunique() if x in df.columns else 1
+        return {
+            "chart_type": "boxplot",
+            "measure": y,
+            "grouped_by": x if x in df.columns else y,
+            "count": int(len(vals)),
+            "groups": int(groups),
+            "median": round(float(vals.median()), 2) if len(vals) else None,
+            "q1": round(float(vals.quantile(0.25)), 2) if len(vals) else None,
+            "q3": round(float(vals.quantile(0.75)), 2) if len(vals) else None,
+            "min": round(float(vals.min()), 2) if len(vals) else None,
+            "max": round(float(vals.max()), 2) if len(vals) else None,
+        }
+    # fallback
+    col = x if x in df.columns else y
+    vals = _to_numeric(df[col]).dropna()
+    return {
+        "chart_type": "boxplot",
+        "measure": col,
+        "grouped_by": col,
+        "count": int(len(vals)),
+        "median": round(float(vals.median()), 2) if len(vals) else None,
+    }
+
+
+def _summary_for_heatmap(df) -> dict:
+    # df is correlation matrix already? For builder we pass corr matrix
+    return {
+        "chart_type": "heatmap",
+        "n_cols": int(df.shape[1]) if hasattr(df, "shape") else 0,
+        "n_rows": int(df.shape[0]) if hasattr(df, "shape") else 0,
+    }
+
+
 def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
     """Create (figure_json, computed_summary, adaptation_note) for a ChartSpec."""
     if df is None or df.empty:
@@ -237,10 +291,11 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
             bucketed = _apply_labels(bucketed, x, y, spec.label_map)
             adaptation.append("Relabeled categories per the edit request.")
 
-        if spec.chart_type == "pie":
+        if spec.chart_type in ("pie", "donut"):
             if (bucketed[y] < 0).any():
-                raise ChartBuildError("Pie chart requires non-negative values.")
-            fig = px.pie(bucketed, names=x, values=y, title=spec.title)
+                raise ChartBuildError("Pie/donut requires non-negative values.")
+            hole = 0.45 if spec.chart_type == "donut" else 0
+            fig = px.pie(bucketed, names=x, values=y, title=spec.title, hole=hole)
             fig.update_traces(textposition="inside", textinfo="percent+label")
             return BuiltChart(
                 figure_json=fig.to_json(),
@@ -253,6 +308,30 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
             ordered = bucketed.sort_values(y, ascending=True)
             fig = px.bar(ordered, x=y, y=x, orientation="h", title=spec.title)
             fig.update_layout(xaxis_title=y, yaxis_title=x)
+        elif spec.chart_type in ("grouped_bar", "stacked_bar", "stacked_100"):
+            # For these, df is expected to have x, group_by, y. If bucketed is single-group aggregated, we need to use original df with group_by
+            # Fallback: if df has group_by, use grouped data; otherwise treat as bar
+            if spec.group_by and spec.group_by in df.columns and y in df.columns:
+                # Re-aggregate with group_by if not already
+                # Use the computed df which should already be grouped by (x, group_by) from codegen
+                # For display, use bucketed if available else df
+                use_df = bucketed if len(bucketed) <= len(df) else df
+                # If stacked_100, normalize
+                if spec.chart_type == "stacked_100":
+                    # Normalize y to percent per x
+                    tmp = use_df.copy()
+                    # Need to pivot normalize: compute total per x
+                    totals = tmp.groupby(x)[y].transform("sum")
+                    tmp[y] = tmp[y] / totals * 100
+                    use_df = tmp
+                    fig = px.bar(use_df, x=x, y=y, color=spec.group_by, title=spec.title, barmode="stack")
+                elif spec.chart_type == "grouped_bar":
+                    fig = px.bar(use_df, x=x, y=y, color=spec.group_by, title=spec.title, barmode="group")
+                else:
+                    fig = px.bar(use_df, x=x, y=y, color=spec.group_by, title=spec.title, barmode="stack")
+            else:
+                fig = px.bar(bucketed, x=x, y=y, title=spec.title)
+            fig.update_layout(xaxis_title=x, yaxis_title=y)
         else:
             fig = px.bar(bucketed, x=x, y=y, title=spec.title)
             fig.update_layout(xaxis_title=x, yaxis_title=y)
@@ -263,19 +342,72 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
             adaptation_note=" ".join(adaptation) or None,
         )
 
-    if spec.chart_type == "line":
+    if spec.chart_type in ("line", "area"):
         if y not in df.columns or y == x:
-            raise ChartBuildError(f"Cannot chart 'line': no value column (spec y='{spec.y}').")
+            raise ChartBuildError(f"Cannot chart '{spec.chart_type}': no value column (spec y='{spec.y}').")
         d = df.sort_values(x)
         if spec.group_by and spec.group_by in d.columns:
-            fig = px.line(d, x=x, y=y, color=spec.group_by, title=spec.title)
+            if spec.chart_type == "area":
+                fig = px.area(d, x=x, y=y, color=spec.group_by, title=spec.title)
+            else:
+                fig = px.line(d, x=x, y=y, color=spec.group_by, title=spec.title)
         else:
-            fig = go.Figure(go.Scatter(x=d[x], y=_to_numeric(d[y]), mode="lines+markers", name=y))
-            fig.update_layout(title=spec.title, xaxis_title=x, yaxis_title=y)
+            if spec.chart_type == "area":
+                fig = px.area(d, x=x, y=y, title=spec.title)
+            else:
+                fig = go.Figure(go.Scatter(x=d[x], y=_to_numeric(d[y]), mode="lines+markers", name=y))
+                fig.update_layout(title=spec.title, xaxis_title=x, yaxis_title=y)
         return BuiltChart(
             figure_json=fig.to_json(),
             computed_summary=_summary_for_line(d, x, y),
             figure_data=_rows(d),
+            adaptation_note=None,
+        )
+
+    if spec.chart_type == "histogram":
+        col = x if x in df.columns else y
+        if col not in df.columns:
+            raise ChartBuildError(f"Histogram requires column '{col}'")
+        fig = px.histogram(df, x=col, title=spec.title)
+        fig.update_layout(xaxis_title=col, yaxis_title="count")
+        return BuiltChart(
+            figure_json=fig.to_json(),
+            computed_summary=_summary_for_histogram(df, col),
+            figure_data=_rows(df[[col]].dropna().head(500)),
+            adaptation_note=None,
+        )
+
+    if spec.chart_type == "boxplot":
+        # y is numeric measure, x optional categorical
+        ycol = y if y in df.columns else x
+        xcol = spec.x if spec.x in df.columns and spec.x != ycol else None
+        if ycol not in df.columns:
+            raise ChartBuildError(f"Box plot requires numeric '{ycol}'")
+        if xcol and xcol in df.columns:
+            fig = px.box(df, x=xcol, y=ycol, title=spec.title)
+        else:
+            fig = px.box(df, y=ycol, title=spec.title)
+        return BuiltChart(
+            figure_json=fig.to_json(),
+            computed_summary=_summary_for_box(df, xcol, ycol),
+            figure_data=_rows(df[[c for c in [xcol, ycol] if c and c in df.columns]].dropna().head(500)),
+            adaptation_note=None,
+        )
+
+    if spec.chart_type == "heatmap":
+        # Expect df to be correlation matrix or raw numeric df; if raw, compute corr
+        numeric_df = df.select_dtypes(include=["number"])
+        if numeric_df.empty:
+            # Try to pick numeric cols from original
+            raise ChartBuildError("Heatmap requires numeric data")
+        corr = numeric_df.corr(numeric_only=True)
+        fig = px.imshow(corr, text_auto=True, aspect="auto", title=spec.title, color_continuous_scale="RdBu", zmin=-1, zmax=1)
+        # Convert corr to rows for figure_data
+        corr_reset = corr.reset_index()
+        return BuiltChart(
+            figure_json=fig.to_json(),
+            computed_summary=_summary_for_heatmap(corr),
+            figure_data=_rows(corr_reset),
             adaptation_note=None,
         )
 
@@ -399,6 +531,53 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
             last_v = float(monthly[y].iloc[-1]) if len(monthly) else 0.0
             checks["first_value"] = cmp(abs(first_v - float(summary.get("first_value", 0))) <= 0.01, first_v, summary.get("first_value"))
             checks["last_value"] = cmp(abs(last_v - float(summary.get("last_value", 0))) <= 0.01, last_v, summary.get("last_value"))
+    elif spec.chart_type in ("area",):
+        # Same as line
+        if y not in raw_df.columns:
+            return False, {"error": f"Value column '{y}' not found in the raw frame."}
+        g = raw_df.copy()
+        g[y] = pd.to_numeric(g[y], errors="coerce")
+        g = g.dropna(subset=[y])
+        monthly = g.groupby(x, as_index=False)[y].sum().sort_values(x)
+        total = float(monthly[y].sum())
+        checks["total"] = cmp(abs(total - float(summary.get("total", 0))) <= 0.01, total, summary.get("total"))
+    elif spec.chart_type in ("grouped_bar", "stacked_bar", "stacked_100", "donut"):
+        # Reuse categorical verification (grouped uses same logic ignoring group_by for total)
+        g = raw_df.copy()
+        if agg == "count" or (not y and agg != "count_distinct"):
+            recomputed = g.groupby(x).size().reset_index(name="count")
+            value_col = "count"
+        elif agg == "count_distinct":
+            if y not in raw_df.columns:
+                return False, {"error": f"Value column '{y}' not found"}
+            recomputed = g.groupby(x)[y].nunique().reset_index(name="count")
+            value_col = "count"
+        else:
+            if y not in raw_df.columns:
+                return False, {"error": f"Value column '{y}' not found"}
+            g[y] = pd.to_numeric(g[y], errors="coerce")
+            g = g.dropna(subset=[y])
+            recomputed = g.groupby(x, as_index=False)[y].sum()
+            value_col = y
+        total = float(recomputed[value_col].sum())
+        checks["total"] = cmp(abs(total - float(summary.get("total", 0))) <= 0.01, total, summary.get("total"))
+    elif spec.chart_type in ("histogram", "boxplot", "heatmap"):
+        # Shape-based verification
+        if spec.chart_type == "histogram":
+            col = x if x in raw_df.columns else y
+            if col not in raw_df.columns:
+                return False, {"error": f"Histogram column '{col}' not found"}
+            n = int(pd.to_numeric(raw_df[col], errors="coerce").dropna().shape[0])
+            checks["count"] = cmp(abs(n - int(summary.get("count", 0))) <= 1, n, summary.get("count"))
+        elif spec.chart_type == "boxplot":
+            col = y if y in raw_df.columns else x
+            if col not in raw_df.columns:
+                return False, {"error": f"Box column '{col}' not found"}
+            n = int(pd.to_numeric(raw_df[col], errors="coerce").dropna().shape[0])
+            checks["count"] = cmp(abs(n - int(summary.get("count", 0))) <= 1, n, summary.get("count"))
+        elif spec.chart_type == "heatmap":
+            n_num = len(raw_df.select_dtypes(include=["number"]).columns)
+            checks["n_cols"] = cmp(n_num == int(summary.get("n_cols", 0)), n_num, summary.get("n_cols"))
     elif spec.chart_type == "scatter":
         xs = spec.x or (list(raw_df.columns)[0] if len(raw_df.columns) else "")
         ys = spec.y or next(

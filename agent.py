@@ -35,9 +35,12 @@ AGENT_SYSTEM_PROMPT = (
     "If the spec contains data_notes, follow those instructions for data transformation "
     "(e.g. split comma-separated values into separate rows using str.split + explode, "
     "use nunique() for count-distinct, apply top-N limits). "
-    "For a bar/pie chart produce one row per category with the aggregated value. "
-    "For a line chart produce one row per time point (aggregated if needed). "
+    "For a bar/pie/donut/grouped/stacked chart produce one row per category (or per x,group) with aggregated value. "
+    "For a line/area chart produce one row per time point (aggregated if needed). "
     "For a scatter chart produce the raw x/y rows. "
+    "For a histogram produce the raw numeric column rows (dropna). "
+    "For a box plot produce raw x(group) and y rows (dropna). "
+    "For a heatmap produce a correlation-ready numeric subset (df.select_dtypes). "
     "Reply with JSON {\"code\": \"...\"} containing only the snippet."
 )
 
@@ -113,7 +116,7 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
         chunks.append(f"result = df[[{_fg(xs)}, {_fg(ys)}]].dropna()")
         return "\n".join(chunks)
 
-    if spec.chart_type == "line":
+    if spec.chart_type in ("line", "area"):
         xcol = x or cols[0]
         if use_nunique and y and y in cols:
             if spec.group_by and spec.group_by in cols:
@@ -138,18 +141,56 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
             )
         return "\n".join(chunks)
 
-    # bar / horizontal_bar / pie
+    if spec.chart_type == "histogram":
+        col = x or y or cols[0]
+        chunks.append(f"result = df[[{_fg(col)}]].dropna()")
+        return "\n".join(chunks)
+
+    if spec.chart_type == "boxplot":
+        ycol = y or x or cols[0]
+        if spec.x and spec.y and spec.x != spec.y:
+            # group + measure
+            chunks.append(f"result = df[[{_fg(spec.x)}, {_fg(spec.y)}]].dropna()")
+        else:
+            chunks.append(f"result = df[[{_fg(ycol)}]].dropna()")
+        return "\n".join(chunks)
+
+    if spec.chart_type == "heatmap":
+        # Return numeric subset for correlation heatmap
+        chunks.append(f"result = df.select_dtypes(include=['number'])")
+        return "\n".join(chunks)
+
+    # bar / horizontal_bar / pie / donut / grouped / stacked
     xcol = x or cols[0]
-    if use_nunique and y and y in cols:
-        chunks.append(
-            f"result = df.groupby({_fg(xcol)})[{_fg(y)}].nunique().reset_index(name='count')"
-        )
-    elif agg == "count" or not y:
-        chunks.append(f"result = df.groupby({_fg(xcol)}).size().reset_index(name='count')")
+    # grouped / stacked need group_by handling
+    if spec.chart_type in ("grouped_bar", "stacked_bar", "stacked_100"):
+        gcol = spec.group_by
+        if gcol and gcol in cols:
+            if use_nunique and y and y in cols:
+                chunks.append(f"result = df.groupby([{_fg(xcol)}, {_fg(gcol)}])[{_fg(y)}].nunique().reset_index(name='count')")
+            elif agg == "count" or not y:
+                chunks.append(f"result = df.groupby([{_fg(xcol)}, {_fg(gcol)}]).size().reset_index(name='count')")
+            else:
+                chunks.append(f"result = df.groupby([{_fg(xcol)}, {_fg(gcol)}])[[{_fg(y)}]].agg('{agg}').reset_index()")
+        else:
+            # Fallback to single x
+            if use_nunique and y and y in cols:
+                chunks.append(f"result = df.groupby({_fg(xcol)})[{_fg(y)}].nunique().reset_index(name='count')")
+            elif agg == "count" or not y:
+                chunks.append(f"result = df.groupby({_fg(xcol)}).size().reset_index(name='count')")
+            else:
+                chunks.append(f"result = df.groupby({_fg(xcol)})[[{_fg(y)}]].agg('{agg}').reset_index()")
     else:
-        chunks.append(
-            f"result = df.groupby({_fg(xcol)})[[{_fg(y)}]].agg('{agg}').reset_index()"
-        )
+        if use_nunique and y and y in cols:
+            chunks.append(
+                f"result = df.groupby({_fg(xcol)})[{_fg(y)}].nunique().reset_index(name='count')"
+            )
+        elif agg == "count" or not y:
+            chunks.append(f"result = df.groupby({_fg(xcol)}).size().reset_index(name='count')")
+        else:
+            chunks.append(
+                f"result = df.groupby({_fg(xcol)})[[{_fg(y)}]].agg('{agg}').reset_index()"
+            )
 
     # --- data_notes: top N ---
     import re as _re
@@ -205,13 +246,24 @@ def _apply_edit(spec: ChartSpec, message: str, known_categories: list[str] | Non
         return spec, "No change: the label was left as is."
 
     mapping = {
-        "line chart": "line",
-        "stacked bar": "bar",
-        "bar chart": "bar",
+        "100% stacked bar": "stacked_100",
+        "100% stacked": "stacked_100",
+        "stacked bar": "stacked_bar",
+        "grouped bar": "grouped_bar",
         "horizontal bar": "horizontal_bar",
+        "bar chart": "bar",
+        "line chart": "line",
+        "area chart": "area",
+        "area": "area",
+        "histogram": "histogram",
+        "box plot": "boxplot",
+        "boxplot": "boxplot",
+        "heatmap": "heatmap",
+        "donut": "donut",
         "pie": "pie",
         "scatter": "scatter",
         "line": "line",
+        "bar": "bar",
     }
     changed = None
     for phrase, ctype in mapping.items():

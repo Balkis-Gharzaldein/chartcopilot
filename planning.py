@@ -835,14 +835,23 @@ def _is_instructions_sheet(name: str) -> bool:
     return "instruction" in n or "guideline" in n
 
 
-def plan_charts(profiles: list[SheetProfile], lines: Sequence[str]) -> list[ChartSpec]:
-    """End-to-end planning: LLM structured call (fallback deterministic, no key)."""
+def plan_charts(profiles: list[SheetProfile], lines: Sequence[str], frames: dict | None = None) -> list[ChartSpec]:
+    """End-to-end planning: LLM structured call (fallback to Viz Intelligence)."""
     data_profiles = [p for p in profiles if p.columns and not _is_instructions_sheet(p.sheet_name)]
     specs: list[ChartSpec] | None = None
+    # Try LLM first
     try:
         specs = _llm_plan(data_profiles, lines)
     except LLMError:
         specs = None
     if specs is None:
-        specs = deterministic_plan(data_profiles, lines)
+        # Use new Viz Intelligence orchestrator (profiler → intent → candidates → gates → scoring → ranking)
+        try:
+            from viz.orchestrator import orchestrate
+            specs = orchestrate(profiles, frames, list(lines))
+            # orchestrator already returns validated specs; if empty, fallback to deterministic_plan
+            if not specs:
+                specs = deterministic_plan(data_profiles, lines)
+        except Exception:
+            specs = deterministic_plan(data_profiles, lines)
     return _ensure_valid_specs(specs, profiles)

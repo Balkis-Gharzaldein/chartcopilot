@@ -113,7 +113,7 @@ line_data = extract_guideline(workbook, text_area or "")
 
 def run_pipeline():
     with st.spinner("Planning chart specs…"):
-        specs = plan_charts(workbook.profiles, line_data.lines)
+        specs = plan_charts(workbook.profiles, line_data.lines, frames=workbook.frames)
     st.session_state.pending_specs = specs
     progress_box = st.empty()
     progress_box.caption("Preparing the sandbox…")

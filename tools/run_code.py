@@ -148,10 +148,24 @@ def _sanitise_frame(df: pd.DataFrame) -> dict:
     trunc = len(df) > MAX_RECORDS
     if trunc:
         df = df.head(MAX_RECORDS)
+    # Convert datetime columns to string for JSON serialization
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]) or df[col].dtype == object and df[col].apply(lambda x: isinstance(x, pd.Timestamp)).any():
+            df[col] = df[col].astype(str)
     try:
         records = df.astype(object).where(pd.notna(df), None).to_dict(orient="records")
+        # Ensure records are JSON-serializable
+        for rec in records:
+            for k, v in list(rec.items()):
+                if isinstance(v, (pd.Timestamp,)):
+                    rec[k] = str(v)
+                elif hasattr(v, "isoformat"):
+                    try:
+                        rec[k] = v.isoformat()
+                    except Exception:
+                        rec[k] = str(v)
     except Exception:
-        records = [dict(zip(map(str, df.columns), row)) for row in df.itertuples(index=False)]
+        records = [dict(zip(map(str, df.columns), [str(v) if isinstance(v, pd.Timestamp) else v for v in row])) for row in df.itertuples(index=False)]
     payload = {
         "kind": "dataframe",
         "columns": [str(c) for c in df.columns],
