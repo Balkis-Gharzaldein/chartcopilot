@@ -391,7 +391,15 @@ def _deterministic_vizspec_split(lines: list[str], sheet_profiles: list[SheetPro
             # Prefer categorical cols for dimensions (live DataProfile if available)
             cat_cols = []
             if live_categorical:
-                cat_cols = list(live_categorical)
+                # Preserve source/profile order. Sets make dimension selection
+                # nondeterministic and can turn an explicit region grouping
+                # into an unrelated low-cardinality column.
+                cat_cols = [
+                    c.name
+                    for p in sheet_profiles
+                    for c in p.columns
+                    if c.name in live_categorical
+                ]
             else:
                 for p in sheet_profiles:
                     for c in p.columns:
@@ -429,8 +437,14 @@ def _deterministic_vizspec_split(lines: list[str], sheet_profiles: list[SheetPro
                 except Exception:
                     return False
             num_cols = []
+            agg = _detect_agg_for_part(part, list(live_numeric) if live_numeric else None)
             if live_numeric:
-                num_cols = list(live_numeric)
+                num_cols = [
+                    c.name
+                    for p in sheet_profiles
+                    for c in p.columns
+                    if c.name in live_numeric
+                ]
             else:
                 for p in sheet_profiles:
                     for c in p.columns:
@@ -509,13 +523,14 @@ def _deterministic_vizspec_split(lines: list[str], sheet_profiles: list[SheetPro
         exp_family = "composition" if "percent" in part.lower() or "share" in part.lower() else "comparison"
         if "top" in part.lower():
             exp_family = "ranking"
+        explicit_type = _detect_chart_type(part)
         vizspecs.append({
             "intent": [goal],
             "dimensions": dims[:1],
             "metrics": metrics,
             "filters": [],
             "conditional_highlighting": None,
-            "expected_chart": {"family": exp_family, "chart_type": None},
+            "expected_chart": {"family": exp_family, "chart_type": explicit_type},
             "time_bucket": "none",
             "title": part[:90],
             "confidence": 0.6,
@@ -687,11 +702,21 @@ def _deterministic_vizspecs(lines: list[str], sheet_profiles: list[SheetProfile]
                 all_cols = [c.name for p in sheet_profiles for c in p.columns]
                 # Find categorical for Style/region
                 dims: list[str] = []
-                for col in all_cols:
-                    cnorm = _norm(col)
-                    if any(tok in low for tok in cnorm.split()):
-                        if col not in dims:
-                            dims.append(col)
+                for p in sheet_profiles:
+                    for c in p.columns:
+                        col = c.name
+                        # A metric mentioned in the question must not also
+                        # become a grouping dimension just because its name
+                        # shares a token with the request.
+                        dtype = c.dtype.lower()
+                        is_temporal = any(token in col.lower() for token in ("date", "time", "year", "month"))
+                        is_categorical = dtype in ("object", "string", "category") or "object" in dtype
+                        if not (is_temporal or is_categorical):
+                            continue
+                        cnorm = _norm(col)
+                        if any(tok in low for tok in cnorm.split()):
+                            if col not in dims:
+                                dims.append(col)
                 # If no dims but has_time, try to find Style-like categorical
                 if not dims:
                     for col in all_cols:
@@ -721,9 +746,30 @@ def _deterministic_vizspecs(lines: list[str], sheet_profiles: list[SheetProfile]
                         if is_num_dtype or is_num_sample:
                             num_cols.append(c.name)
                 metrics = []
+                # Distinct counts target entity columns, which are usually
+                # categorical and therefore absent from num_cols.
+                if any(term in low for term in ("count unique", "count distinct", "unique count", "distinct count")):
+                    distinct_match = re.search(
+                        r"(?:count\s+(?:unique|distinct)|(?:unique|distinct)\s+count)\s+(?:of\s+)?([a-z0-9][a-z0-9 _-]*?)(?:\s+by\b|\s+per\b|\?|$)",
+                        raw,
+                        re.IGNORECASE,
+                    )
+                    query = distinct_match.group(1).strip() if distinct_match else raw
+                    try:
+                        from viz.resolve import score_query as _distinct_score
+
+                        best_col, best_score = None, 0.0
+                        for col in all_cols:
+                            score = _distinct_score(query, col)
+                            if score > best_score:
+                                best_col, best_score = col, score
+                        if best_col and best_score >= 1.0:
+                            metrics = [{"expr": best_col, "agg": "count_distinct"}]
+                    except Exception:
+                        pass
                 for col in num_cols:
                     cnorm = _norm(col)
-                    if any(tok in low for tok in cnorm.split()) or "sales" in low and "gross" in col.lower() or "amount" in low and "amt" in col.lower():
+                    if not metrics and (any(tok in low for tok in cnorm.split()) or "sales" in low and "gross" in col.lower() or "amount" in low and "amt" in col.lower()):
                         metrics.append({"expr": col, "agg": "sum"})
                         break
                 if not metrics and num_cols:
@@ -807,13 +853,25 @@ def _deterministic_vizspecs(lines: list[str], sheet_profiles: list[SheetProfile]
                             break
                 # Deduplicate
                 dims_for_spec = list(dict.fromkeys(dims_for_spec))[:2]
+                if tb != "none":
+                    temporal_names = {
+                        c.name
+                        for p in sheet_profiles
+                        for c in p.columns
+                        if any(token in c.name.lower() for token in ("date", "time", "year", "month"))
+                    }
+                    dims_for_spec.sort(key=lambda name: 0 if name in temporal_names else 1)
                 viz = {
                     "intent": intent_list,
                     "dimensions": dims_for_spec,
                     "metrics": metrics[:2],
                     "filters": filters,
                     "conditional_highlighting": cond,
-                    "expected_chart": {"family": "line" if "trend" in intent_list else "bar", "multi": "trend" in intent_list},
+                    "expected_chart": {
+                        "family": "line" if "trend" in intent_list else "bar",
+                        "chart_type": _detect_chart_type(raw),
+                        "multi": "trend" in intent_list,
+                    },
                     "time_bucket": tb,
                     "title": raw[:90],
                     "confidence": 0.6,

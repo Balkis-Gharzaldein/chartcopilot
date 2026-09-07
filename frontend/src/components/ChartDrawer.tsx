@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../lib/store'
 import { api } from '../lib/api'
 import { applyThemeToFigure } from '../lib/chartTheme'
+import { loadPlotly, normalizePlotlyFigure } from '../lib/plotly'
 
 function DrawerChartPreview({ figureJson, title }: { figureJson: string; title: string }) {
   const ref = useRef<HTMLDivElement>(null)
@@ -9,13 +10,21 @@ function DrawerChartPreview({ figureJson, title }: { figureJson: string; title: 
   useEffect(() => {
     if (!ref.current || !figureJson) return
     let fig: any
-    try { fig = JSON.parse(figureJson) } catch { return }
+    try { fig = normalizePlotlyFigure(JSON.parse(figureJson)) } catch { return }
     applyThemeToFigure(fig, title)
     fig.layout = { ...fig.layout, autosize: true, margin: { t: 32, r: 12, b: 32, l: 48 }, height: 220 }
-    const PlotlyAny: any = (window as any).Plotly
-    if (PlotlyAny?.newPlot) {
-      PlotlyAny.newPlot(ref.current, fig.data, fig.layout, { displayModeBar: false, responsive: true }).then(()=> setReady(true))
-      return () => { try{ PlotlyAny.purge(ref.current)} catch{} }
+    let cancelled = false
+    let PlotlyAny: any
+    loadPlotly().then((plotly) => {
+      if (cancelled || !ref.current) return
+      PlotlyAny = plotly
+      PlotlyAny.newPlot(ref.current, fig.data, fig.layout, { displayModeBar: false, responsive: true }).then(() => {
+        if (!cancelled) setReady(true)
+      })
+    }).catch(() => setReady(false))
+    return () => {
+      cancelled = true
+      if (ref.current && PlotlyAny?.purge) PlotlyAny.purge(ref.current)
     }
   }, [figureJson, title])
   return <div ref={ref} className={`h-[220px] w-full rounded-xl border border-slate-200 bg-white ${ready ? 'fade-slide' : ''}`} />
@@ -54,7 +63,7 @@ export function ChartDrawer() {
     try {
       const idx = results.indexOf(active!)
       const res = await api.refine(workbookId, refineMsg.trim(), idx)
-      setResults(res.results, specs, res.narrative)
+       setResults(res.results, res.results.map((result: any) => result.spec), res.narrative)
       setReply(res.reply)
       setRefineMsg('')
     } catch (e: any) {

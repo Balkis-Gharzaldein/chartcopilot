@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../lib/store'
 import type { ChartResult } from '../lib/store'
 import { applyThemeToFigure } from '../lib/chartTheme'
+import { loadPlotly, normalizePlotlyFigure } from '../lib/plotly'
 
 declare const Plotly: any
 
@@ -67,51 +68,42 @@ export function ChartCard({ result, onSelect, selected }: { result: ChartResult;
 
   useEffect(() => {
     if (!hasFigure || !ref.current || !result.figure_json) return
-    let fig: any
-    try { fig = JSON.parse(result.figure_json) } catch { return }
-    // Apply centralized theme — ensures same palette as backend, not old blue/red
-    applyThemeToFigure(fig, spec.title)
-    // Ensure responsive + hover tooltips on all chart types (additive, non-breaking)
-    fig.layout = {
-      ...fig.layout,
-      autosize: true,
-      hovermode: 'closest',
-      // Enable native zoom/pan when x-axis is dense; Plotly supports it via dragmode
-      dragmode: fig.layout?.xaxis?.type === 'category' && (fig.data?.[0]?.x?.length || 0) > 20 ? 'pan' : fig.layout.dragmode,
-    }
-    // Enable hover templates for precise values if not already set by backend
-    fig.data = (fig.data || []).map((tr: any) => ({
-      ...tr,
-      hovertemplate: tr.hovertemplate || undefined, // keep backend template, fallback to Plotly default which shows x/y
-    }))
-    const PlotlyAny: any = (window as any).Plotly
-    if (PlotlyAny?.newPlot) {
-      setReady(false)
-      const config: any = { displayModeBar: false, responsive: true, scrollZoom: false }
-      // Native zoom/pan only if dense, via config; no custom logic
-      if (fig.data?.[0]?.x?.length > 25) {
-        config.scrollZoom = false
-        // enable mode bar zoom via layout dragmode, not custom
-      }
-      PlotlyAny.newPlot(ref.current, fig.data, fig.layout, config).then(() => setReady(true))
-      const onResize = () => PlotlyAny.Plots.resize(ref.current)
-      window.addEventListener('resize', onResize)
-      return () => {
-        window.removeEventListener('resize', onResize)
-        setReady(false)
-        try { PlotlyAny.purge(ref.current) } catch {}
-      }
-    }
-  }, [result.figure_json, hasFigure, isBar, isLine])
+    let cancelled = false
+    let PlotlyAny: any
+    setReady(false)
 
-  // Lazy load Plotly if not present
-  useEffect(() => {
-    if ((window as any).Plotly) return
-    const s = document.createElement('script')
-    s.src = 'https://cdn.plot.ly/plotly-2.27.0.min.js'
-    s.async = true
-    document.head.appendChild(s)
-  }, [])
+    loadPlotly().then((plotly) => {
+      if (cancelled || !ref.current) return
+      PlotlyAny = plotly
+      let fig: any
+      try { fig = normalizePlotlyFigure(JSON.parse(result.figure_json!)) } catch { return }
+      applyThemeToFigure(fig, spec.title)
+      fig.layout = {
+        ...fig.layout,
+        autosize: true,
+        hovermode: 'closest',
+        dragmode: fig.layout?.xaxis?.type === 'category' && (fig.data?.[0]?.x?.length || 0) > 20 ? 'pan' : fig.layout.dragmode,
+      }
+      fig.data = (fig.data || []).map((tr: any) => ({ ...tr, hovertemplate: tr.hovertemplate || undefined }))
+      const config: any = { displayModeBar: false, responsive: true, scrollZoom: false }
+      Promise.resolve(PlotlyAny.newPlot(ref.current, fig.data, fig.layout, config)).then(() => {
+        if (!cancelled) setReady(true)
+      })
+      const onResize = () => PlotlyAny.Plots?.resize?.(ref.current)
+      window.addEventListener('resize', onResize)
+      ;(ref.current as any).__chartcopilotResize = onResize
+    }).catch(() => {
+      if (!cancelled) setReady(false)
+    })
+
+    return () => {
+      cancelled = true
+      if (ref.current && PlotlyAny?.purge) PlotlyAny.purge(ref.current)
+      const onResize = (ref.current as any)?.__chartcopilotResize
+      if (onResize) window.removeEventListener('resize', onResize)
+      setReady(false)
+    }
+  }, [result.figure_json, hasFigure, isBar, isLine, spec.title])
 
   // Close menu on outside click
   useEffect(() => {

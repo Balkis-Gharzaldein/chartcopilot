@@ -382,7 +382,9 @@ def charts_refine(body: ChartsRefineRequest):
     if not body.refinementRequest or not body.refinementRequest.strip():
         return ChartsRefineResponse(success=False, error="refinementRequest is required")
     try:
-        current_spec = body.currentChartSpec or store.results[body.chartIndex].spec
+        # The server-side result is authoritative. Do not allow a browser to
+        # replace columns, sheet names, or chart metadata during refinement.
+        current_spec = store.results[body.chartIndex].spec
         updated, log = viz_refine_chart(store.workbook, body.chartIndex, store.results, body.refinementRequest.strip(), current_spec)
         # Update store
         new_results = list(store.results)

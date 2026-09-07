@@ -1,20 +1,27 @@
 import { useEffect, useRef } from 'react'
 import { applyThemeToFigure } from '../lib/chartTheme'
 import { RefineBotPanel } from './RefineBotPanel'
+import { loadPlotly, normalizePlotlyFigure } from '../lib/plotly'
 
 export function ChartDetailsPanel({ chart, chartIndex, onRefine, onClose }: { chart: any; chartIndex: number; onRefine: (updatedChart: any, log: string) => void; onClose: () => void }) {
   const ref = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (!ref.current || !chart.figure_json) return
-    let fig: any
-    try { fig = JSON.parse(chart.figure_json) } catch { return }
-    applyThemeToFigure(fig, chart.spec?.title)
-    fig.layout = { ...fig.layout, autosize: true, margin: { t: 32, r: 12, b: 32, l: 48 }, height: 260 }
-    const PlotlyAny: any = (window as any).Plotly
-    if (PlotlyAny?.newPlot) {
+    let cancelled = false
+    let PlotlyAny: any
+    loadPlotly().then((plotly) => {
+      if (cancelled || !ref.current) return
+      PlotlyAny = plotly
+      let fig: any
+      try { fig = normalizePlotlyFigure(JSON.parse(chart.figure_json)) } catch { return }
+      applyThemeToFigure(fig, chart.spec?.title)
+      fig.layout = { ...fig.layout, autosize: true, margin: { t: 32, r: 12, b: 32, l: 48 }, height: 260 }
       PlotlyAny.newPlot(ref.current, fig.data, fig.layout, { displayModeBar: false, responsive: true })
-      return () => { try { PlotlyAny.purge(ref.current) } catch {} }
+    }).catch(() => {})
+    return () => {
+      cancelled = true
+      if (ref.current && PlotlyAny?.purge) PlotlyAny.purge(ref.current)
     }
   }, [chart.figure_json])
 

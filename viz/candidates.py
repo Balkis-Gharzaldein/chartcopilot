@@ -105,6 +105,10 @@ def _best_temporal(profile: DataProfile) -> str | None:
 
 def _pick_agg(intent: AnalyticalIntent, default: str = "sum") -> str:
     if intent.explicit_agg:
+        # "How many units/quantity/pcs" means total units, not row count.
+        if intent.explicit_agg == "count" and "how many" in intent.raw.lower():
+            if any(term in intent.raw.lower() for term in ("unit", "quantity", "qty", "pcs", "volume")):
+                return "sum"
         return intent.explicit_agg
     if intent.goal == "distribution":
         return "count"
@@ -197,8 +201,39 @@ def _unmappable_measure_reason(intent_raw: str, profile: DataProfile) -> str:
             f"column in the schema.{hint} Available columns: {', '.join(cols)}.")
 
 
+def _profit_margin_spec(intent: AnalyticalIntent, profile: DataProfile, sheet_name: str, sid: str) -> ChartSpec | None:
+    """Build a grounded derived profit-margin spec when sales and cost exist."""
+    low = intent.raw.lower()
+    if "profit margin" not in low and not ("margin" in low and "profit" in low):
+        return None
+    numeric = [c.name for c in profile.columns if c.role == "numeric"]
+    sales = next((c for c in numeric if any(t in c.lower() for t in ("sales", "revenue", "gross", "amount"))), None)
+    cost = next((c for c in numeric if any(t in c.lower() for t in ("cost", "cogs", "expense"))), None)
+    if not sales or not cost:
+        return None
+    x = _best_categorical(profile, intent.raw, set(), 100, strict=False)
+    if not x:
+        return None
+    chart_type = intent.explicit_chart_type or "bar"
+    if chart_type not in {"bar", "horizontal_bar", "line"}:
+        chart_type = "bar"
+    return ChartSpec(
+        id=sid,
+        sheet=sheet_name,
+        chart_type=chart_type,
+        title=intent.raw[:90],
+        x=x,
+        y="profit_margin",
+        agg_function="mean",
+        data_notes=f"Derived metric: profit_margin; sales={sales}; cost={cost}.",
+    )
+
+
 def generate_for_intent(intent: AnalyticalIntent, profile: DataProfile, sheet_name: str, idx_offset: int = 0) -> list[ChartSpec]:
     """Generate 1-4 candidates for a single intent."""
+    derived_margin = _profit_margin_spec(intent, profile, sheet_name, f"spec_{idx_offset+1}_profit_margin")
+    if derived_margin:
+        return [derived_margin]
     # Conservative skip: profit margin case etc.
     if intent.goal not in ("overview",) and not _has_measure_match(intent.raw, profile):
         low = intent.raw.lower()

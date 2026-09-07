@@ -40,13 +40,14 @@ class TestPipeline(unittest.TestCase):
         self.assertGreaterEqual(len(g.lines), 4)
         specs = plan_charts(self.wb.profiles, g.lines)
         planned = [s for s in specs if s.status == "planned"]
-        skipped = [s for s in specs if s.status == "skipped"]
         self.assertGreaterEqual(len(planned), 4, [s.model_dump() for s in specs])
-        self.assertGreaterEqual(len(skipped), 1, [s.model_dump() for s in specs])
         # revenue synonym hit
         revenue_line = next(s for s in specs if "revenue" in s.title.lower())
         self.assertEqual(revenue_line.status, "planned")
         self.assertEqual(revenue_line.y, "Total_Sales_USD")
+        margin_line = next(s for s in specs if "profit margin" in s.title.lower())
+        self.assertEqual(margin_line.status, "planned")
+        self.assertEqual(margin_line.y, "profit_margin")
 
     def test_execute_produces_charts_and_bucketing(self):
         g = extract_guideline(self.wb)

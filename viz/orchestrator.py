@@ -437,13 +437,18 @@ def orchestrate(profiles: list[SheetProfile], frames: dict | None, lines: list[s
                 # Generate candidates via existing generator (goal-driven, data-aware)
                 specs = generate_for_intent(intent, dprof, prof.sheet_name, idx_offset=v_idx * 10)
                 # Fallback: if generator returns empty (e.g., variance_zero filtered), create direct spec from VizSpec
-                if not specs:
+                if not specs or all(s.status == "skipped" for s in specs):
                     viz_dims = vizspec.get("dimensions", [])
                     viz_metrics = vizspec.get("metrics", [])
                     viz_time = vizspec.get("time_bucket", "none")
                     viz_exp = vizspec.get("expected_chart") or {}
                     # Direct construction from VizSpec
-                    x = viz_dims[0] if viz_dims and viz_dims[0] in [c.name for c in prof.columns] else (dprof.categorical_cols[0] if dprof.categorical_cols else None)
+                    valid_cols = [c.name for c in prof.columns]
+                    temporal_dims = [d for d in viz_dims if d in dprof.temporal_cols]
+                    if (vizspec.get("time_bucket") != "none" or intent.goal == "trend") and temporal_dims:
+                        x = temporal_dims[0]
+                    else:
+                        x = viz_dims[0] if viz_dims and viz_dims[0] in valid_cols else (dprof.categorical_cols[0] if dprof.categorical_cols else None)
                     y = None
                     agg = "sum"
                     if viz_metrics and isinstance(viz_metrics[0], dict):
@@ -454,7 +459,10 @@ def orchestrate(profiles: list[SheetProfile], frames: dict | None, lines: list[s
                         if col in [c.name for c in prof.columns]:
                             y = col
                             agg = viz_metrics[0].get("agg") or "sum"
-                    ctype = viz_exp.get("chart_type") if viz_exp and viz_exp.get("chart_type") in ["bar","pie","line","scatter","grouped_bar","stacked_bar","stacked_100","area","histogram","boxplot","heatmap","donut","horizontal_bar"] else (tree_candidates[0] if tree_candidates else "bar")
+                    ctype = viz_exp.get("chart_type") if viz_exp and viz_exp.get("chart_type") in ["bar","pie","line","scatter","grouped_bar","stacked_bar","stacked_100","area","histogram","boxplot","heatmap","donut","horizontal_bar"] else (
+                        "line" if (vizspec.get("time_bucket") != "none" or intent.goal == "trend") and temporal_dims
+                        else (tree_candidates[0] if tree_candidates else "bar")
+                    )
                     title = vizspec.get("title") or intent.raw[:90] or f"{y or 'count'} by {x}" if x else "Chart"
                     specs = [ChartSpec(id=f"spec_{v_idx*10+1}_{ctype}", sheet=prof.sheet_name, chart_type=ctype, title=title[:90], x=x, y=y, agg_function=agg, status="planned")]
                     # Re-apply dimensions/metrics already set, continue to override loop below
@@ -552,6 +560,13 @@ def orchestrate(profiles: list[SheetProfile], frames: dict | None, lines: list[s
                             spec.y = col
                             if m0.get("agg"):
                                 spec.agg_function = m0.get("agg")
+                    # A distinct-count metric is itself often the categorical
+                    # entity (for example CUSTOMER). It must not also be used
+                    # as a line-series grouping field, otherwise a monthly
+                    # customer-count request becomes an unusable high-card
+                    # customer chart.
+                    if spec.group_by and spec.group_by == spec.y and (spec.agg_function or "").lower() == "count_distinct":
+                        spec.group_by = None
                     # Time bucket → data_notes and ensure temporal x if needed
                     if viz_time and viz_time != "none":
                         if spec.data_notes:
@@ -659,7 +674,42 @@ def orchestrate(profiles: list[SheetProfile], frames: dict | None, lines: list[s
                 all_ranked.append(RankedCandidate(spec=spec, score=score, goal=intent.goal, reason=reason, breakdown=breakdown, gate_reasons=[can.reason, app.reason]))
 
     if not all_ranked:
-        # Fallback: try at least one exploratory candidate as skipped? Return empty
+        # Some valid requests, especially distinct counts over time, do not
+        # have a candidate because the entity metric is categorical. Build a
+        # grounded direct spec instead of silently returning no chart.
+        if vizspec_mode and vizspecs:
+            direct: list[ChartSpec] = []
+            for idx, vizspec in enumerate(vizspecs[:2]):
+                prof = data_profiles[0]
+                dprof = profile_data(prof, frames.get(prof.sheet_name) if frames else None)
+                dims = [d for d in vizspec.get("dimensions", []) if d in [c.name for c in prof.columns]]
+                time_dims = [d for d in dims if d in dprof.temporal_cols]
+                x = time_dims[0] if time_dims else (dims[0] if dims else None)
+                metrics = vizspec.get("metrics", [])
+                y = None
+                agg = "count"
+                if metrics:
+                    expr = metrics[0].get("expr", "") if isinstance(metrics[0], dict) else str(metrics[0])
+                    y = re.sub(r".*\((.*)\).*", r"\1", expr).strip().strip("\"'`")
+                    if y not in [c.name for c in prof.columns]:
+                        y = None
+                    if isinstance(metrics[0], dict):
+                        agg = metrics[0].get("agg") or agg
+                expected = vizspec.get("expected_chart") or {}
+                ctype = expected.get("chart_type") if isinstance(expected, dict) else None
+                if ctype not in ("line", "bar", "horizontal_bar", "pie", "scatter", "grouped_bar", "stacked_bar", "stacked_100", "area", "histogram", "boxplot", "heatmap", "donut"):
+                    ctype = "line" if time_dims or vizspec.get("time_bucket") != "none" else "bar"
+                direct.append(ChartSpec(
+                    id=f"spec_direct_{idx + 1}",
+                    sheet=prof.sheet_name,
+                    chart_type=ctype,
+                    title=(vizspec.get("title") or "Chart")[:90],
+                    x=x,
+                    y=y,
+                    agg_function=agg,
+                    data_notes=(f"Time bucket: {vizspec.get('time_bucket')}." if vizspec.get("time_bucket") not in (None, "none") else None),
+                ))
+            return direct
         return []
 
     # Separate skipped vs planned for ranking

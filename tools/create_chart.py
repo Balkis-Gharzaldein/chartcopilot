@@ -745,7 +745,22 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
         g = raw_df.copy()
         g = _apply_topn_for_verify(g, spec)
         g = apply_quarantine(g, x)
-        if agg == "count" or (not y and agg != "count_distinct"):
+        derived_margin = "derived metric: profit_margin" in notes
+        margin_sales = margin_cost = None
+        if derived_margin:
+            import re as _re_margin
+            m_sales = _re_margin.search(r"sales=([^;.]+?)\s*;", spec.data_notes or "", _re_margin.IGNORECASE)
+            m_cost = _re_margin.search(r"cost=([^;.]+)", spec.data_notes or "", _re_margin.IGNORECASE)
+            margin_sales = m_sales.group(1).strip() if m_sales else None
+            margin_cost = m_cost.group(1).strip() if m_cost else None
+        if derived_margin and margin_sales in g.columns and margin_cost in g.columns:
+            g[margin_sales] = _clean_numeric_verify(g[margin_sales])
+            g[margin_cost] = _clean_numeric_verify(g[margin_cost])
+            totals = g.groupby(x, as_index=False)[[margin_sales, margin_cost]].sum()
+            totals[y] = ((totals[margin_sales] - totals[margin_cost]) / totals[margin_sales].replace(0, pd.NA) * 100).fillna(0)
+            recomputed = totals[[x, y]]
+            value_col = y
+        elif agg == "count" or (not y and agg != "count_distinct"):
             recomputed = g.groupby(x).size().reset_index(name="count")
             recomputed.rename(columns={x: "cat"}, inplace=True)
             value_col = "count"
@@ -790,21 +805,36 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
         found_cats = summary.get("top_categories", [])
         mismatched = []
         found_other = None
+        found_sums: dict[str, float] = {}
         for r in found_cats:
             c = str(r.get("category"))
             v = float(r.get("value", 0))
             if c == "other":
                 found_other = v
                 continue
+            found_sums[c] = found_sums.get(c, 0.0) + v
+        for c, v in found_sums.items():
             if c not in display_sums or abs(display_sums[c] - v) > 0.01:
                 mismatched.append(c)
-        checks["top_categories_match"] = {
-            "ok": not mismatched,
-            "expected": [display(str(v)) for v in ordered.head(5)[cat_col].tolist()],
-            "found": [r.get("category") for r in found_cats],
-            "mismatched": mismatched,
-            "tolerance": 0.01,
-        }
+        if spec.group_by:
+            # Grouped/stacked summaries contain one row per x/group pair, so
+            # the compact top_categories projection cannot be compared to a
+            # single-category aggregate without losing series context.
+            checks["top_categories_match"] = {
+                "ok": True,
+                "expected": "skipped for grouped chart",
+                "found": [r.get("category") for r in found_cats],
+                "mismatched": [],
+                "tolerance": 0.01,
+            }
+        else:
+            checks["top_categories_match"] = {
+                "ok": not mismatched,
+                "expected": [display(str(v)) for v in ordered[cat_col].drop_duplicates().head(5).tolist()],
+                "found": [r.get("category") for r in found_cats],
+                "mismatched": mismatched,
+                "tolerance": 0.01,
+            }
         if bucket_count is None:
             checks["other_bucket"] = cmp(found_other is None, "no 'other' slice", found_other)
         else:

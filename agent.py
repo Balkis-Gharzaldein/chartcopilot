@@ -96,6 +96,15 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
     x, y = spec.x, spec.y
     cols = list(df.columns)
     notes = (spec.data_notes or "").lower()
+    derived_margin = "derived metric: profit_margin" in notes
+    margin_sales = margin_cost = None
+    if derived_margin:
+        m_sales = re.search(r"sales=([^;.]+?)\s*;", spec.data_notes or "", re.IGNORECASE)
+        m_cost = re.search(r"cost=([^;.]+)", spec.data_notes or "", re.IGNORECASE)
+        margin_sales = m_sales.group(1).strip() if m_sales else None
+        margin_cost = m_cost.group(1).strip() if m_cost else None
+        if margin_sales not in cols or margin_cost not in cols:
+            derived_margin = False
     # Normalize group_by coherence at codegen level as well
     GROUP_AWARE = {"grouped_bar", "stacked_bar", "stacked_100", "line", "area", "scatter", "heatmap", "boxplot"}
     if spec.group_by and spec.group_by in (x, y):
@@ -112,6 +121,9 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
     if y and y in cols:
         # Use deep cleaning like histogram branch, preserve raw for display but ensure numeric for sum
         chunks.append(f"df[{_fg(y)}] = pd.to_numeric(df[{_fg(y)}].astype(str).str.replace(r'[\\$,%]', '', regex=True).str.strip(), errors='coerce')")
+    if derived_margin and margin_sales and margin_cost:
+        chunks.append(f"df[{_fg(margin_sales)}] = pd.to_numeric(df[{_fg(margin_sales)}].astype(str).str.replace(r'[\\$,%]', '', regex=True).str.strip(), errors='coerce')")
+        chunks.append(f"df[{_fg(margin_cost)}] = pd.to_numeric(df[{_fg(margin_cost)}].astype(str).str.replace(r'[\\$,%]', '', regex=True).str.strip(), errors='coerce')")
         # Don't dropna yet fully, keep for later dropna in groupby paths, but at least ensure numeric
     # Also clean rank_col for Top-N if present in data_notes
     if notes and "top" in notes.lower():
@@ -154,29 +166,19 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
                 chunks.append(f"df[{_fg(x)}] = pd.to_datetime(df[{_fg(x)}], errors='coerce')")
                 chunks.append(f"df = df.dropna(subset=[{_fg(x)}])")
                 chunks.append(f"df['_time_bucket'] = df[{_fg(x)}].dt.to_period('M').astype(str)")
-                # Update spec.x to match derived column for later chart building
-                try:
-                    object.__setattr__(spec, "x", "_time_bucket")
-                except Exception:
-                    spec.x = "_time_bucket"
+                # Keep the planned source column on the spec. The derived
+                # bucket exists only in the sandbox result and must not leak
+                # into stored specs used by later executions/refinements.
                 x = "_time_bucket"
             elif bucket == "quarterly":
                 chunks.append(f"df[{_fg(x)}] = pd.to_datetime(df[{_fg(x)}], errors='coerce')")
                 chunks.append(f"df = df.dropna(subset=[{_fg(x)}])")
                 chunks.append(f"df['_time_bucket'] = df[{_fg(x)}].dt.to_period('Q').astype(str)")
-                try:
-                    object.__setattr__(spec, "x", "_time_bucket")
-                except Exception:
-                    spec.x = "_time_bucket"
                 x = "_time_bucket"
             elif bucket == "yearly":
                 chunks.append(f"df[{_fg(x)}] = pd.to_datetime(df[{_fg(x)}], errors='coerce')")
                 chunks.append(f"df = df.dropna(subset=[{_fg(x)}])")
                 chunks.append(f"df['_time_bucket'] = df[{_fg(x)}].dt.year.astype(str)")
-                try:
-                    object.__setattr__(spec, "x", "_time_bucket")
-                except Exception:
-                    spec.x = "_time_bucket"
                 x = "_time_bucket"
 
     # Filter pushdown: handle structured filters from VizSpec (in_top_n, last_n, in, between)
@@ -287,6 +289,11 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
 
     if spec.chart_type in ("line", "area"):
         xcol = x or cols[0]
+        if derived_margin:
+            chunks.append(f"_m = df.groupby({_fg(xcol)}, as_index=False)[[{_fg(margin_sales)}, {_fg(margin_cost)}]].sum()")
+            chunks.append(f"_m[{_fg(y)}] = ((_m[{_fg(margin_sales)}] - _m[{_fg(margin_cost)}]) / _m[{_fg(margin_sales)}].replace(0, pd.NA) * 100).fillna(0)")
+            chunks.append(f"result = _m[[{_fg(xcol)}, {_fg(y)}]]")
+            return "\n".join(chunks)
         if use_nunique and y and y in cols:
             if spec.group_by and spec.group_by in cols:
                 chunks.append(
@@ -334,6 +341,11 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
 
     # bar / horizontal_bar / pie / donut / grouped / stacked
     xcol = x or cols[0]
+    if derived_margin:
+        chunks.append(f"_m = df.groupby({_fg(xcol)}, as_index=False)[[{_fg(margin_sales)}, {_fg(margin_cost)}]].sum()")
+        chunks.append(f"_m[{_fg(y)}] = ((_m[{_fg(margin_sales)}] - _m[{_fg(margin_cost)}]) / _m[{_fg(margin_sales)}].replace(0, pd.NA) * 100).fillna(0)")
+        chunks.append(f"result = _m[[{_fg(xcol)}, {_fg(y)}]]")
+        return "\n".join(chunks)
     # grouped / stacked need group_by handling
     if spec.chart_type in ("grouped_bar", "stacked_bar", "stacked_100"):
         gcol = spec.group_by
@@ -647,7 +659,14 @@ def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) 
 
         # --- act: build the chart ---------------------------------------------
         try:
-            chart = create_chart.build_chart(spec, built_df)  # tool call #3
+            # Time buckets are derived inside the sandbox. Build against a
+            # temporary render spec while returning the original source
+            # column in the stored ChartSpec.
+            render_spec = spec
+            if spec.x not in built_df.columns and "_time_bucket" in built_df.columns:
+                render_spec = spec.model_copy()
+                render_spec.x = "_time_bucket"
+            chart = create_chart.build_chart(render_spec, built_df)  # tool call #3
         except ChartBuildError as exc:
             last_error = str(exc)
             feedback = f"Chart build failed (attempt {attempt + 1}): {exc}"
@@ -663,7 +682,7 @@ def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) 
         verified, verification = create_chart.verify_computed(_verify_spec, df, chart.computed_summary)
 
         # --- semantic validation: verify result logic ---
-        validation_result = validate_chart(spec, df, built_df, chart.computed_summary)
+        validation_result = validate_chart(render_spec, df, built_df, chart.computed_summary)
 
         # --- recommendations: generate related chart specs (not executed yet) ---
         profile = workbook.profile_for(spec.sheet)

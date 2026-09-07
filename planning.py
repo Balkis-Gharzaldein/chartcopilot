@@ -887,7 +887,9 @@ def _ensure_valid_specs(specs: list[ChartSpec], profiles: list[SheetProfile]) ->
             spec.id = f"spec_{i}"
         used_ids.add(spec.id)
 
-        fields = [("x", spec.x), ("y", spec.y), ("group_by", spec.group_by)]
+        # Validate against the normalized spec below. Keep this list close to
+        # the missing-column check so group_by normalization cannot leave it
+        # stale.
         if spec.status != "planned":
             out.append(spec)
             continue
@@ -913,10 +915,18 @@ def _ensure_valid_specs(specs: list[ChartSpec], profiles: list[SheetProfile]) ->
         if spec.group_by and spec.group_by not in col_names:
             # Ignore invalid group_by gracefully for non-grouped charts, else skip
             if spec.chart_type in GROUP_AWARE:
-                missing.append("group_by")
+                spec.status = "skipped"
+                spec.skip_reason = f"Referenced column(s) not found in sheet '{spec.sheet}': group_by."
+                out.append(spec)
+                continue
             else:
                 spec.group_by = None
-        missing = [label for label, val in fields if val and val not in col_names]
+        fields = [("x", spec.x), ("y", spec.y), ("group_by", spec.group_by)]
+        derived_y = bool(spec.data_notes and "derived metric:" in spec.data_notes.lower())
+        missing = [
+            label for label, val in fields
+            if val and val not in col_names and not (label == "y" and derived_y)
+        ]
         if missing:
             # For group_by only, clear it instead of skipping if not required
             if missing == ["group_by"] and spec.chart_type not in GROUP_AWARE:

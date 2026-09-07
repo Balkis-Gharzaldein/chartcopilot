@@ -1,0 +1,25 @@
+Date,Channel,Region,Campaign,Customer_ID,Customer_Segment,Impressions,Clicks,Conversions,Spend_USD,Revenue_USD
+2025-01-01,Search,North,Winter Sale,C001,New,12000,720,54,1800,5400
+2025-01-01,Social,South,Winter Sale,C002,Returning,18000,810,43,1500,4300
+2025-01-01,Email,East,Winter Sale,C003,Returning,6000,900,81,500,7200
+2025-01-01,Display,West,Winter Sale,C004,New,22000,440,18,1200,2100
+2025-02-01,Search,North,Valentine Offer,C005,New,14000,840,67,2100,6700
+2025-02-01,Social,South,Valentine Offer,C006,Returning,20000,1000,58,1700,5800
+2025-02-01,Email,East,Valentine Offer,C007,Returning,7000,1050,96,550,8100
+2025-02-01,Display,West,Valentine Offer,C008,New,24000,480,22,1350,2500
+2025-03-01,Search,North,Spring Launch,C001,New,16000,960,74,2300,7600
+2025-03-01,Social,South,Spring Launch,C009,New,21000,1050,61,1800,6200
+2025-03-01,Email,East,Spring Launch,C010,Returning,8000,1200,108,600,9000
+2025-03-01,Display,West,Spring Launch,C011,New,26000,520,25,1450,2900
+2025-04-01,Search,North,Clearance,C012,Returning,15000,900,72,2000,6900
+2025-04-01,Social,South,Clearance,C013,Returning,19000,950,55,1600,5300
+2025-04-01,Email,East,Clearance,C014,New,7500,1125,99,575,8400
+2025-04-01,Display,West,Clearance,C015,New,23000,460,20,1250,2350
+2025-05-01,Search,North,Member Week,C016,Returning,17000,1020,88,2400,8800
+2025-05-01,Social,South,Member Week,C017,Returning,22000,1100,70,1900,7100
+2025-05-01,Email,East,Member Week,C018,Returning,9000,1350,126,650,10200
+2025-05-01,Display,West,Member Week,C019,New,28000,560,27,1550,3100
+2025-06-01,Search,North,Summer Preview,C020,New,19000,1140,91,2600,9400
+2025-06-01,Social,South,Summer Preview,C021,New,23000,1150,76,2050,7600
+2025-06-01,Email,East,Summer Preview,C022,Returning,9500,1425,134,700,10900
+2025-06-01,Display,West,Summer Preview,C023,New,30000,600,29,1650,3300

@@ -3,7 +3,6 @@ import { Link } from 'react-router-dom'
 import { useStore } from '../lib/store'
 import { GenerationSection } from '../components/GenerationSection'
 import { ChartCard } from '../components/ChartCard'
-import { ChartDetailsPanel } from '../components/ChartDetailsPanel'
 
 export function VisualizationPage() {
   const { workbookId, results, setResults, activeChartId, setActiveChart } = useStore()
@@ -48,9 +47,6 @@ export function VisualizationPage() {
     setResults(next, nextSpecs, narrative)
     setActiveChart(refinedChart.spec.id)
   }
-
-  const selectedChart = results.find(r => r.spec.id === activeChartId) || null
-  const selectedIndex = selectedChart ? results.indexOf(selectedChart) : -1
 
   if (!hasWorkbook) {
     return (
@@ -110,9 +106,6 @@ export function VisualizationPage() {
               <p className="text-xs text-red-700">⚠️ {error}</p>
               <button onClick={() => setError(null)} className="mt-2 text-xs underline text-red-600">Dismiss</button>
             </div>
-          )}
-          {selectedChart && (
-            <ChartDetailsPanel chart={selectedChart} chartIndex={selectedIndex} onRefine={handleRefine} onClose={() => setActiveChart(null)} />
           )}
         </div>
       </div>
