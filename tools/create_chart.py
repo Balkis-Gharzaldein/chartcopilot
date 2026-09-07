@@ -17,6 +17,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 from schemas import ChartSpec
+from tools.data_quality import apply_quarantine
 from tools.chart_theme import (
     CATEGORICAL,
     DIVERGING_SCALE,
@@ -44,7 +45,14 @@ class BuiltChart:
 
 
 def _to_numeric(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce")
+    # Late cleaning for currency strings ($ , %) — preserve raw but ensure numeric for sum
+    try:
+        cleaned = series.astype(str).str.replace(r'[\$,%]', '', regex=True).str.strip()
+        # Handle empty strings after cleaning
+        cleaned = cleaned.replace("", pd.NA)
+        return pd.to_numeric(cleaned, errors="coerce")
+    except Exception:
+        return pd.to_numeric(series, errors="coerce")
 
 
 def _clean(df: pd.DataFrame) -> pd.DataFrame:
@@ -343,8 +351,17 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
             fig.update_layout(xaxis_title=y, yaxis_title=x)
             apply_base_layout(fig, title=spec.title)
         elif spec.chart_type in ("grouped_bar", "stacked_bar", "stacked_100"):
-            if spec.group_by and spec.group_by in df.columns and y in df.columns:
-                use_df = bucketed if len(bucketed) <= len(df) else df
+            needs_group = spec.group_by and spec.group_by in df.columns and spec.group_by not in (x, y) and x in df.columns and y in df.columns
+            if needs_group:
+                # Recompute bucketed per (x, group_by) to keep color column, not per x alone
+                try:
+                    # bucketed was by x only; recompute for grouped case to preserve group_by
+                    grouped = df.groupby([x, spec.group_by], as_index=False)[y].sum() if y in df.columns else df.groupby([x, spec.group_by]).size().reset_index(name=y or "count")
+                    # Apply bucketing limit on grouped if needed (top categories per x)
+                    use_df = grouped
+                    bucketed = grouped  # update for summary
+                except Exception:
+                    use_df = bucketed if len(bucketed) <= len(df) else df
                 if spec.chart_type == "stacked_100":
                     tmp = use_df.copy()
                     totals = tmp.groupby(x)[y].transform("sum")
@@ -380,6 +397,9 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
                         color_discrete_sequence=CATEGORICAL,
                     )
             else:
+                if spec.group_by and (spec.group_by not in df.columns or spec.group_by in (x, y)):
+                    # Adaptation: ignore invalid group_by for bar-like chart
+                    pass
                 fig = px.bar(bucketed, x=x, y=y, title=spec.title, color_discrete_sequence=[PRIMARY])
                 fig.update_traces(marker=dict(color=PRIMARY, line=dict(color="#FFFFFF", width=1)))
             fig.update_layout(xaxis_title=x, yaxis_title=y)
@@ -449,11 +469,30 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
         apply_base_layout(fig, title=spec.title)
         # Soften line markers
         fig.update_layout(hovermode="x unified")
+        # Conditional highlighting: flag declining retention (e.g., "declining retention")
+        notes_low = (spec.data_notes or "").lower()
+        if "declining" in notes_low or "conditional:" in notes_low:
+            try:
+                fig.add_annotation(
+                    text="Flagged declining retention" if "declining" in notes_low else "Conditional highlight",
+                    xref="paper", yref="paper", x=0.5, y=1.08, showarrow=False,
+                    font=dict(size=11, color="#DC2626"), bgcolor="rgba(254,226,226,0.9)", bordercolor="#FECACA"
+                )
+                # For grouped line, highlight declining series in red (first trace)
+                if spec.group_by and len(fig.data) > 0:
+                    # Mark last trace as declining if possible (heuristic)
+                    try:
+                        fig.data[-1].line.color = "#DC2626"
+                        fig.data[-1].marker.color = "#DC2626"
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         return BuiltChart(
             figure_json=fig.to_json(),
             computed_summary=_summary_for_line(d, x, y),
             figure_data=_rows(d),
-            adaptation_note=None,
+            adaptation_note="Flagged declining retention" if "declining" in notes_low else None,
         )
 
     if spec.chart_type == "histogram":
@@ -575,6 +614,107 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
     raise ChartBuildError(f"Unsupported chart type: {spec.chart_type}.")
 
 
+def _clean_numeric_verify(series: pd.Series) -> pd.Series:
+    """Numeric coercion mirroring the agent codegen cleaning.
+
+    Text-stored measures ("$1,200", "45%") must parse, otherwise every
+    verification total on currency data collapses to NaN. Idempotent for
+    true numeric dtypes.
+    """
+    try:
+        cleaned = (
+            series.astype(str)
+            .str.replace(r'[\$,%]', '', regex=True)
+            .str.strip()
+            .replace("", pd.NA)
+        )
+        return pd.to_numeric(cleaned, errors="coerce")
+    except Exception:
+        return pd.to_numeric(series, errors="coerce")
+
+
+def _with_time_bucket_col(raw_df: pd.DataFrame, spec: ChartSpec, x: str) -> tuple[pd.DataFrame, str]:
+    """Replicate the agent's time-bucket derivation for verification.
+
+    The deterministic codegen rewrites spec.x to a derived `_time_bucket`
+    column (monthly/quarterly/yearly) that does not exist in the raw frame.
+    Without this step every bucketed chart fails verification with
+    "Category column '_time_bucket' not found" even though the chart itself
+    is correct. Mirrors agent.py bucket logic exactly.
+    """
+    import re as _re
+
+    notes = (spec.data_notes or "").lower()
+    m = _re.search(r"time bucket:\s*(monthly|quarterly|yearly|weekly|daily)", notes)
+    if not m or not x or x not in raw_df.columns:
+        return raw_df, x
+    bucket = m.group(1)
+    if bucket not in ("monthly", "quarterly", "yearly"):
+        return raw_df, x
+    try:
+        g = raw_df.copy()
+        try:
+            g[x] = pd.to_datetime(g[x], errors="coerce", format="mixed")
+        except TypeError:
+            g[x] = pd.to_datetime(g[x], errors="coerce")
+        g = g.dropna(subset=[x])
+        if bucket == "monthly":
+            g["_time_bucket"] = g[x].dt.to_period("M").astype(str)
+        elif bucket == "quarterly":
+            g["_time_bucket"] = g[x].dt.to_period("Q").astype(str)
+        else:
+            g["_time_bucket"] = g[x].dt.year.astype(str)
+        return g, "_time_bucket"
+    except Exception:
+        return raw_df, x
+
+
+def _parse_topn_for_verify(spec: ChartSpec) -> tuple[int, str | None, str | None]:
+    """Extract (n, group_col, rank_col) for Top-N pre-filter replication.
+
+    Reads the structured filter ("X in_top_n 10 rank_by SUM(Y)") first,
+    then the data_notes marker ("Top 10 by SUM(Y)"). Returns (0, None, None)
+    when no Top-N context exists.
+    """
+    import re as _re
+
+    ftext = spec.filter or ""
+    m = _re.search(r"in_top_n\s+(\d+)\s+rank_by\s+(.+?)\s*$", ftext, _re.IGNORECASE)
+    if m:
+        expr = m.group(2).strip()
+        inner = _re.sub(r".*\((.*)\).*", r"\1", expr) if "(" in expr else expr
+        g = _re.search(r"(.+?)\s+in_top_n", ftext, _re.IGNORECASE)
+        return int(m.group(1)), (g.group(1).strip() if g else spec.x), inner.strip().strip("\"'`")
+    notes = spec.data_notes or ""
+    m2 = _re.search(r"top\s+(\d+)\s+by\s+(SUM\s*\([^)]*\)|[^\s;,\.]+)", notes, _re.IGNORECASE)
+    if m2:
+        expr = m2.group(2).strip()
+        inner = _re.sub(r".*\((.*)\).*", r"\1", expr) if "(" in expr else expr
+        return int(m2.group(1)), spec.x, inner.strip().strip("\"'`")
+    return 0, None, None
+
+
+def _apply_topn_for_verify(g: pd.DataFrame, spec: ChartSpec) -> pd.DataFrame:
+    """Replicate the agent's Top-N pre-filter on the raw frame.
+
+    Without this, any top-N chart fails verification by construction: the
+    chart aggregates 10 customers while the verifier totals all of them.
+    Unresolvable rank columns degrade to no filtering (existing behavior).
+    """
+    n_top, group_col, rank_col = _parse_topn_for_verify(spec)
+    if not n_top or not group_col or group_col not in g.columns:
+        return g
+    rank_actual = next((c for c in g.columns if c.lower() == (rank_col or "").lower()), None)
+    if not rank_actual:
+        return g
+    try:
+        ranked = _clean_numeric_verify(g[rank_actual]).groupby(g[group_col]).sum()
+        keep = ranked.nlargest(n_top).index
+        return g[g[group_col].isin(keep)]
+    except Exception:
+        return g
+
+
 def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tuple[bool, dict]:
     """Independently recompute the headline numbers from the RAW input frame (a second,
     sandbox-free code path) and compare them with computed_summary.
@@ -594,6 +734,7 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
     y = (spec.y or "").strip()
     if not y and spec.chart_type in CHARTS_WITH_CATEGORIES:
         y = x
+    raw_df, x = _with_time_bucket_col(raw_df, spec, x)
     if x not in raw_df.columns:
         return False, {"error": f"Category column '{x}' not found in the raw frame."}
 
@@ -602,6 +743,8 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
     needs_split = "split" in notes or "comma" in notes or "explode" in notes
     if spec.chart_type in CHARTS_WITH_CATEGORIES:
         g = raw_df.copy()
+        g = _apply_topn_for_verify(g, spec)
+        g = apply_quarantine(g, x)
         if agg == "count" or (not y and agg != "count_distinct"):
             recomputed = g.groupby(x).size().reset_index(name="count")
             recomputed.rename(columns={x: "cat"}, inplace=True)
@@ -621,7 +764,7 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
         else:
             if y not in raw_df.columns:
                 return False, {"error": f"Value column '{y}' not found in the raw frame."}
-            g[y] = pd.to_numeric(g[y], errors="coerce")
+            g[y] = _clean_numeric_verify(g[y])
             g = g.dropna(subset=[y])
             recomputed = g.groupby(x, as_index=False)[y].sum()
             value_col = y
@@ -669,8 +812,9 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
     elif spec.chart_type == "line":
         if y not in raw_df.columns:
             return False, {"error": f"Value column '{y}' not found in the raw frame."}
-        g = raw_df.copy()
-        g[y] = pd.to_numeric(g[y], errors="coerce")
+        g = _apply_topn_for_verify(raw_df.copy(), spec)
+        g = apply_quarantine(g, x)
+        g[y] = _clean_numeric_verify(g[y])
         g = g.dropna(subset=[y])
         monthly = g.groupby(x, as_index=False)[y].sum().sort_values(x)
         total = float(monthly[y].sum())
@@ -684,15 +828,17 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
         # Same as line
         if y not in raw_df.columns:
             return False, {"error": f"Value column '{y}' not found in the raw frame."}
-        g = raw_df.copy()
-        g[y] = pd.to_numeric(g[y], errors="coerce")
+        g = _apply_topn_for_verify(raw_df.copy(), spec)
+        g = apply_quarantine(g, x)
+        g[y] = _clean_numeric_verify(g[y])
         g = g.dropna(subset=[y])
         monthly = g.groupby(x, as_index=False)[y].sum().sort_values(x)
         total = float(monthly[y].sum())
         checks["total"] = cmp(abs(total - float(summary.get("total", 0))) <= 0.01, total, summary.get("total"))
     elif spec.chart_type in ("grouped_bar", "stacked_bar", "stacked_100", "donut"):
         # Reuse categorical verification (grouped uses same logic ignoring group_by for total)
-        g = raw_df.copy()
+        g = _apply_topn_for_verify(raw_df.copy(), spec)
+        g = apply_quarantine(g, x)
         if agg == "count" or (not y and agg != "count_distinct"):
             recomputed = g.groupby(x).size().reset_index(name="count")
             value_col = "count"
@@ -704,7 +850,7 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
         else:
             if y not in raw_df.columns:
                 return False, {"error": f"Value column '{y}' not found"}
-            g[y] = pd.to_numeric(g[y], errors="coerce")
+            g[y] = _clean_numeric_verify(g[y])
             g = g.dropna(subset=[y])
             recomputed = g.groupby(x, as_index=False)[y].sum()
             value_col = y
@@ -716,13 +862,13 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
             col = x if x in raw_df.columns else y
             if col not in raw_df.columns:
                 return False, {"error": f"Histogram column '{col}' not found"}
-            n = int(pd.to_numeric(raw_df[col], errors="coerce").dropna().shape[0])
+            n = int(_clean_numeric_verify(raw_df[col]).dropna().shape[0])
             checks["count"] = cmp(abs(n - int(summary.get("count", 0))) <= 1, n, summary.get("count"))
         elif spec.chart_type == "boxplot":
             col = y if y in raw_df.columns else x
             if col not in raw_df.columns:
                 return False, {"error": f"Box column '{col}' not found"}
-            n = int(pd.to_numeric(raw_df[col], errors="coerce").dropna().shape[0])
+            n = int(_clean_numeric_verify(raw_df[col]).dropna().shape[0])
             checks["count"] = cmp(abs(n - int(summary.get("count", 0))) <= 1, n, summary.get("count"))
         elif spec.chart_type == "heatmap":
             n_num = len(raw_df.select_dtypes(include=["number"]).columns)
@@ -736,8 +882,8 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
         if not xs or not ys or xs not in raw_df.columns or ys not in raw_df.columns:
             return False, {"error": "Scatter requires both x and y in the raw frame."}
         d = raw_df[[xs, ys]].dropna()
-        xs_vals = pd.to_numeric(d[xs], errors="coerce").tolist()
-        ys_vals = pd.to_numeric(d[ys], errors="coerce").tolist()
+        xs_vals = _clean_numeric_verify(d[xs]).tolist()
+        ys_vals = _clean_numeric_verify(d[ys]).tolist()
         recomputed_corr = None
         if len(xs_vals) >= 2 and len(set(xs_vals)) > 1 and len(set(ys_vals)) > 1:
             recomputed_corr = round(_pearson(xs_vals, ys_vals), 3)

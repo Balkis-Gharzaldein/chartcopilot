@@ -22,6 +22,10 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -33,6 +37,7 @@ from llm import available_provider
 from narrative import synthesize_narrative
 from planning import plan_charts
 from schemas import ChartResult, ChartSpec, SheetProfile
+from viz.refiner import refine_chart as viz_refine_chart
 
 app = FastAPI(
     title="ChartCopilot API",
@@ -183,6 +188,31 @@ def get_workbook(workbook_id: str):
     )
 
 
+@app.get("/api/workbooks/{workbook_id}/data-profile")
+def get_data_profile(workbook_id: str):
+    """Expanded Data Profile: uses viz.profiler with frames if available.
+    Returns sheet_name -> DataProfile (per-column + dataset-level stats).
+    Lazy-loaded by DatasetPage; sampled for >10k rows is handled inside profiler (still exact for small files).
+    """
+    entry = _get_store(workbook_id)
+    from viz.profiler import profile_workbook
+
+    try:
+        profiles = profile_workbook(entry.workbook.profiles, entry.workbook.frames)
+        # Serialize DataProfile dataclasses to JSON-safe dict
+        import dataclasses
+
+        out: dict[str, Any] = {}
+        for sheet, dp in profiles.items():
+            d = dataclasses.asdict(dp)
+            # Ensure tuples (top_correlations) are JSON serializable
+            d["top_correlations"] = [list(t) for t in d.get("top_correlations", [])]
+            out[sheet] = d
+        return out
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Failed to compute data profile: {exc}") from exc
+
+
 @app.post("/api/workbooks/{workbook_id}/guideline", response_model=GuidelineResponse)
 def get_guideline(workbook_id: str, body: GuidelineRequest):
     entry = _get_store(workbook_id)
@@ -289,6 +319,80 @@ def refine(workbook_id: str, body: RefineRequest):
         entry.results = results
         entry.narrative = synthesize_narrative(entry.results)
         return RefineResponse(results=entry.results, narrative=entry.narrative, reply=f"{note}\n{change_msg}", target_index=idx)
+
+
+class ChartsGenerateRequest(BaseModel):
+    workbookId: str = Field(description="Workbook ID from upload")
+    userQuestion: str = Field(description="Natural language question, e.g. 'Show sales by region'")
+    sheetName: str | None = Field(default=None, description="Optional sheet name")
+
+class ChartsGenerateResponse(BaseModel):
+    success: bool
+    charts: list[ChartResult] = Field(default_factory=list)
+    error: str | None = None
+
+class ChartsRefineRequest(BaseModel):
+    workbookId: str
+    chartIndex: int = Field(description="Index of chart in results")
+    refinementRequest: str = Field(description="Natural language refinement, e.g. 'change colors to blue and orange'")
+    currentChartSpec: ChartSpec | None = Field(default=None, description="Current chart spec being refined")
+
+class ChartsRefineResponse(BaseModel):
+    success: bool
+    updatedChart: ChartResult | None = None
+    refinementLog: str | None = None
+    error: str | None = None
+
+
+@app.post("/api/charts/generate", response_model=ChartsGenerateResponse, summary="Generate charts from natural language question")
+def charts_generate(body: ChartsGenerateRequest):
+    store = STORE.get(body.workbookId)
+    if not store:
+        return ChartsGenerateResponse(success=False, charts=[], error=f"workbookId '{body.workbookId}' not found")
+    if not body.userQuestion or not body.userQuestion.strip():
+        return ChartsGenerateResponse(success=False, charts=[], error="userQuestion is required")
+    try:
+        # Call existing orchestrator with user question as intent
+        specs = plan_charts(store.workbook.profiles, [body.userQuestion.strip()], frames=store.workbook.frames)
+        # Filter to sheet if requested
+        if body.sheetName:
+            specs = [s for s in specs if s.sheet == body.sheetName]
+            if not specs:
+                # Fallback to all if sheet filter yields none
+                specs = plan_charts(store.workbook.profiles, [body.userQuestion.strip()], frames=store.workbook.frames)
+        results = execute_plan(store.workbook, specs, attempt_llm=_has_llm())
+        # Update store for refine to work
+        store.specs = specs
+        store.results = results
+        store.narrative = synthesize_narrative(results)
+        return ChartsGenerateResponse(success=True, charts=results)
+    except Exception as exc:  # noqa: BLE001
+        return ChartsGenerateResponse(success=False, charts=[], error=str(exc))
+
+
+@app.post("/api/charts/refine", response_model=ChartsRefineResponse, summary="Refine an existing chart via natural language")
+def charts_refine(body: ChartsRefineRequest):
+    store = STORE.get(body.workbookId)
+    if not store:
+        return ChartsRefineResponse(success=False, error=f"workbookId '{body.workbookId}' not found")
+    if not store.results:
+        return ChartsRefineResponse(success=False, error="No charts to refine. Generate charts first.")
+    if not (0 <= body.chartIndex < len(store.results)):
+        return ChartsRefineResponse(success=False, error="chartIndex out of range")
+    if not body.refinementRequest or not body.refinementRequest.strip():
+        return ChartsRefineResponse(success=False, error="refinementRequest is required")
+    try:
+        current_spec = body.currentChartSpec or store.results[body.chartIndex].spec
+        updated, log = viz_refine_chart(store.workbook, body.chartIndex, store.results, body.refinementRequest.strip(), current_spec)
+        # Update store
+        new_results = list(store.results)
+        new_results[body.chartIndex] = updated
+        store.results = new_results
+        store.specs[body.chartIndex] = updated.spec
+        store.narrative = synthesize_narrative(store.results)
+        return ChartsRefineResponse(success=True, updatedChart=updated, refinementLog=log)
+    except Exception as exc:  # noqa: BLE001
+        return ChartsRefineResponse(success=False, error=str(exc))
 
 
 @app.delete("/api/workbooks/{workbook_id}")

@@ -1,19 +1,54 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../lib/store'
 import { api } from '../lib/api'
+import { applyThemeToFigure } from '../lib/chartTheme'
+
+function DrawerChartPreview({ figureJson, title }: { figureJson: string; title: string }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [ready, setReady] = useState(false)
+  useEffect(() => {
+    if (!ref.current || !figureJson) return
+    let fig: any
+    try { fig = JSON.parse(figureJson) } catch { return }
+    applyThemeToFigure(fig, title)
+    fig.layout = { ...fig.layout, autosize: true, margin: { t: 32, r: 12, b: 32, l: 48 }, height: 220 }
+    const PlotlyAny: any = (window as any).Plotly
+    if (PlotlyAny?.newPlot) {
+      PlotlyAny.newPlot(ref.current, fig.data, fig.layout, { displayModeBar: false, responsive: true }).then(()=> setReady(true))
+      return () => { try{ PlotlyAny.purge(ref.current)} catch{} }
+    }
+  }, [figureJson, title])
+  return <div ref={ref} className={`h-[220px] w-full rounded-xl border border-slate-200 bg-white ${ready ? 'fade-slide' : ''}`} />
+}
 
 export function ChartDrawer() {
   const { results, activeChartId, setActiveChart, workbookId, setResults, specs } = useStore()
+  const tab = (useStore as any)((s: any) => s.drawerTab ?? 'data')
+  const setTab = (useStore as any)((s: any) => s.setDrawerTab)
+  const addToast = (useStore as any)((s: any) => s.addToast)
   const active = results.find(r => r.spec.id === activeChartId) || null
-  const [tab, setTab] = useState<'data'|'computed'|'validation'|'refine'>('data')
   const [refineMsg, setRefineMsg] = useState('')
   const [refining, setRefining] = useState(false)
   const [reply, setReply] = useState<string | null>(null)
 
   if (!active) return null
 
+  const close = () => { setActiveChart(null); setTab('data') }
+
+  const goalMap: Record<string,string> = {
+    bar:'Comparison', horizontal_bar:'Ranking', grouped_bar:'Comparison', stacked_bar:'Composition', stacked_100:'Composition',
+    line:'Trend', area:'Trend', scatter:'Relationship', histogram:'Distribution', boxplot:'Distribution', heatmap:'Correlation', pie:'Composition', donut:'Composition'
+  }
+  const goal = goalMap[active.spec.chart_type] || 'Overview'
+
   async function doRefine() {
-    if (!refineMsg.trim() || !workbookId) return
+    if (!refineMsg.trim()) return
+    if (!workbookId) {
+      const msg = 'No workbook loaded. Re-upload the dataset, then refine.'
+      setReply(msg)
+      addToast?.(msg, 'error')
+      return
+    }
     setRefining(true)
     setReply(null)
     try {
@@ -23,128 +58,175 @@ export function ChartDrawer() {
       setReply(res.reply)
       setRefineMsg('')
     } catch (e: any) {
-      setReply(e.message || 'Refine failed')
+      const msg = e.message || 'Refine failed'
+      setReply(msg)
+      addToast?.(msg, 'error')
     } finally { setRefining(false) }
+  }
+
+  const downloadPNG = () => {
+    // Find the ChartCard's gd by title? Instead, use preview's div if we had ref, but simpler: find by active id
+    // For drawer, we can reuse the preview's Plotly instance if we store ref, but for now just download from preview
+    // We'll trigger download via the preview's div
+    const gd = document.querySelector(`[data-drawer-chart="${active.spec.id}"]`) as any
+    const PlotlyAny: any = (window as any).Plotly
+    if (gd && PlotlyAny?.downloadImage) {
+      const base = active.spec.title.trim().toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9\-_]+/g,'-').slice(0,60) || 'chart'
+      PlotlyAny.downloadImage(gd, { format: 'png', width: 1600, height: 900, filename: base, scale: 2 })
+    } else {
+      addToast?.('Chart image is still loading — try again in a moment.', 'info')
+    }
   }
 
   return (
     <div className="fixed inset-0 z-40">
-      <div className="absolute inset-0 bg-black/20" onClick={() => setActiveChart(null)} />
-      <div className="absolute right-0 top-0 h-full w-[420px] max-w-[92vw] bg-white border-l shadow-xl flex flex-col">
-        <div className="h-12 flex items-center justify-between px-4 border-b shrink-0">
+      <div className="absolute inset-0 bg-slate-900/20 backdrop-blur-[1px] fade-slide" onClick={close} />
+      <div className="absolute right-0 top-0 h-full w-full sm:w-[440px] max-w-[92vw] bg-slate-50 border-l border-slate-200 shadow-xl flex flex-col fade-slide sm:rounded-l-2xl overflow-hidden">
+        <div className="h-14 flex items-center justify-between px-4 bg-white border-b border-slate-200 shrink-0">
           <div className="min-w-0">
-            <p className="text-sm font-semibold truncate">{active.spec.title}</p>
-            <p className="text-xs text-zinc-500 truncate">{active.spec.chart_type} · {active.spec.x} {active.spec.y ? `→ ${active.spec.y}` : ''}</p>
+            <p className="text-sm font-semibold truncate text-slate-900">{active.spec.title}</p>
+            <p className="text-[11px] text-slate-500 truncate flex items-center gap-1.5">
+              <span className="px-1.5 py-0.5 rounded bg-slate-900 text-white text-[10px]">{active.spec.chart_type}</span>
+              <span>{goal}</span>
+              {active.verified && <span className="px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px]">Verified ✓</span>}
+            </p>
           </div>
-          <button onClick={() => setActiveChart(null)} className="h-8 w-8 rounded-full hover:bg-zinc-100 flex items-center justify-center shrink-0">✕</button>
+          <button onClick={close} className="h-8 w-8 rounded-full hover:bg-slate-100 flex items-center justify-center shrink-0 text-slate-600">✕</button>
         </div>
 
-        <div className="flex gap-1 p-2 border-b bg-zinc-50 shrink-0">
+        <div className="p-3 bg-white border-b border-slate-100">
+          {active.figure_json ? (
+            <div data-drawer-chart={active.spec.id}>
+              <DrawerChartPreview figureJson={active.figure_json} title={active.spec.title} />
+            </div>
+          ) : (
+            <div className="h-[220px] rounded-xl border border-dashed border-slate-200 bg-slate-50 flex items-center justify-center text-xs text-slate-500">No chart preview</div>
+          )}
+          <div className="mt-2 flex gap-2">
+            <button onClick={downloadPNG} className="flex-1 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-medium hover:bg-slate-800">Download PNG</button>
+            <button onClick={() => setTab('refine')} className="flex-1 py-1.5 rounded-lg bg-amber-500 text-white text-xs font-medium hover:bg-amber-600">Refine</button>
+          </div>
+        </div>
+
+        <div className="flex gap-1 p-2 border-b border-slate-200 bg-slate-50 shrink-0">
           {(['data','computed','validation','refine'] as const).map(t => (
             <button
               key={t}
               onClick={() => setTab(t)}
-              className={`flex-1 px-3 py-1.5 rounded-lg text-xs font-medium capitalize ${tab===t ? 'bg-zinc-900 text-white' : 'hover:bg-white border border-transparent hover:border-zinc-200'}`}
+              className={`flex-1 px-3 py-1.5 rounded-lg text-xs font-medium capitalize transition-colors ${tab===t ? 'bg-slate-900 text-white shadow' : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-50'}`}
             >
               {t}
             </button>
           ))}
         </div>
 
-        <div className="flex-1 overflow-auto p-4">
+        <div className="flex-1 overflow-auto p-4 bg-slate-50">
           {tab === 'data' && (
-            <div className="space-y-3">
+            <div key="data" className="space-y-3 fade-slide">
               {active.figure_data?.length ? (
-                <div className="rounded-xl border overflow-hidden">
-                  <div className="max-h-[420px] overflow-auto">
+                <div className="rounded-xl border border-slate-200 overflow-hidden bg-white card-shadow">
+                  <div className="max-h-[320px] overflow-auto">
                     <table className="w-full text-xs">
-                      <thead className="sticky top-0 bg-zinc-50">
+                      <thead className="sticky top-0 bg-white border-b border-slate-200">
                         <tr>
                           {Object.keys(active.figure_data[0] || {}).map(k => (
-                            <th key={k} className="px-2 py-1.5 text-left font-medium text-zinc-600 border-b">{k}</th>
+                            <th key={k} className="px-3 py-2 text-left font-medium text-slate-600">{k}</th>
                           ))}
                         </tr>
                       </thead>
                       <tbody>
                         {active.figure_data.slice(0,120).map((row,i) => (
-                          <tr key={i} className="border-t">
+                          <tr key={i} className="border-t border-slate-100 hover:bg-slate-50/60">
                             {Object.values(row).map((v:any, j) => (
-                              <td key={j} className="px-2 py-1 truncate max-w-[140px]">{String(v ?? '')}</td>
+                              <td key={j} className="px-3 py-1.5 truncate max-w-[140px] text-slate-700">{String(v ?? '')}</td>
                             ))}
                           </tr>
                         ))}
                       </tbody>
                     </table>
                   </div>
-                  {active.figure_data.length > 120 && <p className="text-[11px] text-zinc-500 px-2 py-1">Showing 120 of {active.figure_data.length} rows</p>}
+                  {active.figure_data.length > 120 && <p className="text-[11px] text-slate-500 px-3 py-2 border-t">Showing 120 of {active.figure_data.length} rows</p>}
                 </div>
               ) : (
-                <p className="text-sm text-zinc-500">No tabular rows for this chart.</p>
+                <p className="text-sm text-slate-500">No tabular rows for this chart.</p>
               )}
-              {active.adaptation_note && <p className="text-xs text-zinc-500 bg-zinc-50 border rounded-lg p-2">Note: {active.adaptation_note}</p>}
+              {active.adaptation_note && <p className="text-xs text-slate-600 bg-white border border-slate-200 rounded-xl p-3 card-shadow">Note: {active.adaptation_note}</p>}
             </div>
           )}
 
           {tab === 'computed' && (
-            <pre className="text-xs bg-zinc-950 text-zinc-100 rounded-xl p-3 overflow-auto max-h-[520px]">{JSON.stringify(active.computed_summary, null, 2)}</pre>
+            <div key="computed" className="fade-slide">
+              <div className="bg-white rounded-xl border border-slate-200 card-shadow p-3">
+                <p className="text-xs font-semibold text-slate-900 mb-2">Computed Summary</p>
+                <pre className="text-xs bg-slate-50 text-slate-800 rounded-lg p-3 overflow-auto max-h-[420px] border border-slate-200">{JSON.stringify(active.computed_summary, null, 2)}</pre>
+              </div>
+              <div className="mt-3 bg-white rounded-xl border border-slate-200 card-shadow p-3">
+                <p className="text-xs font-medium text-slate-700">Data used</p>
+                <p className="text-[11px] text-slate-500 mt-1">{active.spec.x ? `x: ${active.spec.x}` : ''} {active.spec.y ? `· y: ${active.spec.y}` : ''} {active.spec.group_by ? `· group: ${active.spec.group_by}` : ''}</p>
+              </div>
+            </div>
           )}
 
           {tab === 'validation' && (
-            <div className="space-y-3 text-xs">
-              <div className={`rounded-lg border px-3 py-2 ${active.verified ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-amber-50 border-amber-200 text-amber-800'}`}>
-                {active.verified ? '✓ Verified against source data' : `Verification: ${(active.verification as any)?.failed?.join(', ') || 'see checks'}`}
+            <div key="validation" className="space-y-3 text-xs fade-slide">
+              <div className={`rounded-xl border p-3 card-shadow ${active.verified ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-amber-50 border-amber-200 text-amber-800'}`}>
+                <p className="font-medium">{active.verified ? '✓ Verified against source data' : `Verification: ${(active.verification as any)?.failed?.join(', ') || 'see checks'}`}</p>
+                <p className="text-[11px] opacity-80 mt-1">Independent recomputation {active.verified ? 'matched' : 'did not match'} computed summary.</p>
               </div>
               {(active.validation?.warnings?.length ?? 0) > 0 && (
-                <div className="space-y-1">
-                  <p className="font-medium">Warnings</p>
+                <div className="bg-white rounded-xl border border-slate-200 card-shadow p-3">
+                  <p className="text-xs font-medium text-slate-900">Warnings</p>
                   {active.validation!.warnings.map((w:string,i:number) => (
-                    <p key={i} className="text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1">{w}</p>
+                    <p key={i} className="text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1.5 mt-2 text-xs">{w}</p>
                   ))}
                 </div>
               )}
               {(active.validation?.errors?.length ?? 0) > 0 && (
-                <div className="space-y-1">
-                  <p className="font-medium">Errors</p>
+                <div className="bg-white rounded-xl border border-slate-200 card-shadow p-3">
+                  <p className="text-xs font-medium text-slate-900">Errors</p>
                   {active.validation!.errors.map((e:string,i:number) => (
-                    <p key={i} className="text-red-700 bg-red-50 border border-red-200 rounded-lg px-2 py-1">{e}</p>
+                    <p key={i} className="text-red-700 bg-red-50 border border-red-200 rounded-lg px-2 py-1.5 mt-2 text-xs">{e}</p>
                   ))}
                 </div>
               )}
               {!((active.validation?.warnings?.length ?? 0) > 0) && !((active.validation?.errors?.length ?? 0) > 0) && (
-                <p className="text-zinc-500">No semantic issues detected.</p>
+                <p className="text-slate-500 bg-white rounded-xl border border-slate-200 card-shadow p-3">No semantic issues detected.</p>
               )}
-              <details className="rounded-lg border p-2">
-                <summary className="cursor-pointer font-medium">Raw verification</summary>
-                <pre className="mt-2 text-[11px] overflow-auto">{JSON.stringify(active.verification, null, 2)}</pre>
+              <details className="bg-white rounded-xl border border-slate-200 card-shadow p-3">
+                <summary className="cursor-pointer font-medium text-slate-900">Raw verification</summary>
+                <pre className="mt-2 text-[11px] overflow-auto bg-slate-50 p-2 rounded-lg border border-slate-200">{JSON.stringify(active.verification, null, 2)}</pre>
               </details>
             </div>
           )}
 
           {tab === 'refine' && (
-            <div className="space-y-3">
-              <p className="text-xs text-zinc-500">Edit this chart with natural language — e.g. "Make it a stacked bar", "Show top 10", "Focus on Q1"</p>
-              <textarea
-                value={refineMsg}
-                onChange={e => setRefineMsg(e.target.value)}
-                placeholder='e.g. "Make this a bar chart" or "Show top 10 categories"'
-                rows={3}
-                className="w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900"
-              />
-              <button
-                onClick={doRefine}
-                disabled={refining || !refineMsg.trim()}
-                className="w-full h-9 rounded-xl bg-zinc-900 text-white text-sm font-medium hover:bg-zinc-800 disabled:opacity-40"
-              >
-                {refining ? 'Refining…' : 'Refine chart'}
-              </button>
-              {reply && <div className="text-xs bg-zinc-50 border rounded-xl p-2 whitespace-pre-wrap">{reply}</div>}
-              <div className="text-xs text-zinc-500 space-y-1">
-                <p>Try:</p>
-                <ul className="list-disc list-inside space-y-0.5">
-                  <li><button onClick={() => setRefineMsg('Make it a bar chart')} className="underline hover:text-zinc-700">Make it a bar chart</button></li>
-                  <li><button onClick={() => setRefineMsg('Show top 10 categories')} className="underline hover:text-zinc-700">Show top 10</button></li>
-                  <li><button onClick={() => setRefineMsg('Make it a horizontal bar')} className="underline hover:text-zinc-700">Make it horizontal</button></li>
-                </ul>
+            <div key="refine" className="space-y-3 fade-slide">
+              <div className="bg-white rounded-xl border border-slate-200 card-shadow p-3">
+                <p className="text-xs font-semibold text-slate-900">Refine this chart</p>
+                <p className="text-xs text-slate-500 mt-1">Use natural language — the backend will re-run intent → gates → ranking.</p>
+                <textarea
+                  value={refineMsg}
+                  onChange={e => setRefineMsg(e.target.value)}
+                  placeholder='e.g. "Make this a stacked bar chart" or "Show only the top 10 categories"'
+                  rows={3}
+                  className="mt-3 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500"
+                />
+                <button
+                  onClick={doRefine}
+                  disabled={refining || !refineMsg.trim()}
+                  className="mt-3 w-full h-9 rounded-xl bg-amber-500 text-white text-sm font-medium hover:bg-amber-600 disabled:opacity-40"
+                >
+                  {refining ? 'Refining…' : 'Refine chart'}
+                </button>
+                {reply && <div className="mt-3 text-xs bg-slate-50 border border-slate-200 rounded-xl p-3 whitespace-pre-wrap">{reply}</div>}
+              </div>
+              <div className="bg-white rounded-xl border border-slate-200 card-shadow p-3">
+                <p className="text-xs font-medium text-slate-900">Try</p>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  <button onClick={() => setRefineMsg('Make this a stacked bar chart')} className="chip-lift text-xs px-2.5 py-1 rounded-full bg-slate-100 hover:bg-white border border-slate-200 text-slate-700">Stacked bar</button>
+                  <button onClick={() => setRefineMsg('Show only the top 10 categories')} className="chip-lift text-xs px-2.5 py-1 rounded-full bg-slate-100 hover:bg-white border border-slate-200 text-slate-700">Top 10</button>
+                  <button onClick={() => setRefineMsg('Use a different grouping')} className="chip-lift text-xs px-2.5 py-1 rounded-full bg-slate-100 hover:bg-white border border-slate-200 text-slate-700">Different grouping</button>
+                </div>
               </div>
             </div>
           )}

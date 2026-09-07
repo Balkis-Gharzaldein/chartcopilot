@@ -21,6 +21,14 @@ from planning import recommend_charts
 from schemas import ChartResult, ChartSpec, SheetProfile
 from tools import create_chart, inspect_data, run_code
 from tools.create_chart import ChartBuildError
+from tools.data_quality import (
+    MONTH_LABEL_RE,
+    NUMERIC_DATE_RE,
+    apply_quarantine,
+    blank_row_count,
+    quarantine_report,
+    should_quarantine,
+)
 from tools.semantic_validation import validate_chart
 
 MAX_ATTEMPTS = 2
@@ -35,6 +43,8 @@ AGENT_SYSTEM_PROMPT = (
     "If the spec contains data_notes, follow those instructions for data transformation "
     "(e.g. split comma-separated values into separate rows using str.split + explode, "
     "use nunique() for count-distinct, apply top-N limits). "
+    "When grouping by a non-temporal categorical dimension, exclude month-like "
+    "cells (e.g. 'Feb-22', '09-14-21' — misaligned source rows) from the grouping. "
     "For a bar/pie/donut/grouped/stacked chart produce one row per category (or per x,group) with aggregated value. "
     "For a line/area chart produce one row per time point (aggregated if needed). "
     "For a scatter chart produce the raw x/y rows. "
@@ -80,19 +90,178 @@ def _fg(col: str) -> str:
 
 def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
     agg = spec.agg_function or "sum"
+    # Handle percent as sum (percentage will be normalized in chart layer)
+    if agg == "percent":
+        agg = "sum"
     x, y = spec.x, spec.y
     cols = list(df.columns)
     notes = (spec.data_notes or "").lower()
+    # Normalize group_by coherence at codegen level as well
+    GROUP_AWARE = {"grouped_bar", "stacked_bar", "stacked_100", "line", "area", "scatter", "heatmap", "boxplot"}
+    if spec.group_by and spec.group_by in (x, y):
+        spec.group_by = None
+    if spec.chart_type not in GROUP_AWARE and spec.group_by:
+        spec.group_by = None
 
     if not y and cols:
         numeric = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
         y = numeric[0] if numeric else None
 
     chunks: list[str] = []
+    # Late cleaning for currency strings ($ , %): ensure y is numeric before any agg (Top 10 concatenated bug)
+    if y and y in cols:
+        # Use deep cleaning like histogram branch, preserve raw for display but ensure numeric for sum
+        chunks.append(f"df[{_fg(y)}] = pd.to_numeric(df[{_fg(y)}].astype(str).str.replace(r'[\\$,%]', '', regex=True).str.strip(), errors='coerce')")
+        # Don't dropna yet fully, keep for later dropna in groupby paths, but at least ensure numeric
+    # Also clean rank_col for Top-N if present in data_notes
+    if notes and "top" in notes.lower():
+        import re as _re_rank
+        m_rank = _re_rank.search(r"top\s+\d+\s+by\s+([^\s;,\.]+)", notes, re.IGNORECASE)
+        if m_rank:
+            rank_col_raw = m_rank.group(1).strip().strip("'\"")
+            import re as _re3
+            rank_col_clean = _re3.sub(r".*\((.*)\).*", r"\1", rank_col_raw) if "(" in rank_col_raw else rank_col_raw
+            rank_col_clean = rank_col_clean.strip()
+            if rank_col_clean and rank_col_clean in cols:
+                chunks.append(f"df[{_fg(rank_col_clean)}] = pd.to_numeric(df[{_fg(rank_col_clean)}].astype(str).str.replace(r'[\\$,%]', '', regex=True).str.strip(), errors='coerce')")
+
+    # Misaligned-row quarantine: month-like cells ("Feb-22", "09-14-21")
+    # stored inside a NON-temporal dimension never belong to that grouping.
+    # Emitted before ranking/aggregation so top-N and totals are computed on
+    # clean groups; the verifier applies the identical rule host-side.
+    # Sandbox-safe: plain str.match with literal patterns, no imports.
+    if x and x in cols and should_quarantine(df, x):
+        chunks.append(
+            f"_qlab = df[{_fg(x)}].astype(str); "
+            f"df = df[~(_qlab.str.match({MONTH_LABEL_RE!r}, na=False).fillna(False) | "
+            f"_qlab.str.match({NUMERIC_DATE_RE!r}, na=False).fillna(False))]"
+        )
+        if spec.data_notes and "quarantined" not in spec.data_notes.lower():
+            try:
+                object.__setattr__(spec, "data_notes",
+                                   (spec.data_notes + " Quarantined misaligned month-like values.").strip())
+            except Exception:
+                spec.data_notes = (spec.data_notes + " Quarantined misaligned month-like values.").strip()
+
+    # Time bucket: derive period column if spec asks for monthly/quarterly/yearly
+    if notes and "time bucket:" in notes:
+        import re as _re_tb
+        m_tb = _re_tb.search(r"time bucket:\s*(monthly|quarterly|yearly|weekly|daily)", notes)
+        if m_tb and x and x in cols:
+            bucket = m_tb.group(1)
+            # Try to parse temporal column to datetime then bucket
+            if bucket == "monthly":
+                chunks.append(f"df[{_fg(x)}] = pd.to_datetime(df[{_fg(x)}], errors='coerce')")
+                chunks.append(f"df = df.dropna(subset=[{_fg(x)}])")
+                chunks.append(f"df['_time_bucket'] = df[{_fg(x)}].dt.to_period('M').astype(str)")
+                # Update spec.x to match derived column for later chart building
+                try:
+                    object.__setattr__(spec, "x", "_time_bucket")
+                except Exception:
+                    spec.x = "_time_bucket"
+                x = "_time_bucket"
+            elif bucket == "quarterly":
+                chunks.append(f"df[{_fg(x)}] = pd.to_datetime(df[{_fg(x)}], errors='coerce')")
+                chunks.append(f"df = df.dropna(subset=[{_fg(x)}])")
+                chunks.append(f"df['_time_bucket'] = df[{_fg(x)}].dt.to_period('Q').astype(str)")
+                try:
+                    object.__setattr__(spec, "x", "_time_bucket")
+                except Exception:
+                    spec.x = "_time_bucket"
+                x = "_time_bucket"
+            elif bucket == "yearly":
+                chunks.append(f"df[{_fg(x)}] = pd.to_datetime(df[{_fg(x)}], errors='coerce')")
+                chunks.append(f"df = df.dropna(subset=[{_fg(x)}])")
+                chunks.append(f"df['_time_bucket'] = df[{_fg(x)}].dt.year.astype(str)")
+                try:
+                    object.__setattr__(spec, "x", "_time_bucket")
+                except Exception:
+                    spec.x = "_time_bucket"
+                x = "_time_bucket"
+
+    # Filter pushdown: handle structured filters from VizSpec (in_top_n, last_n, in, between)
+    # Case-insensitive column resolution: data_notes are lowercased while real
+    # columns may be "GROSS AMT", so every membership test here resolves
+    # through _rcol() instead of raw `in cols`.
+    _cols_lower = {c.lower(): c for c in cols}
+    def _rcol(name: str | None) -> str | None:
+        if not name:
+            return None
+        if name in cols:
+            return name
+        hit = _cols_lower.get(name.lower())
+        if hit:
+            return hit
+        try:
+            from viz.resolve import normalize as _norm_res
+            want = _norm_res(name)
+            for c in cols:
+                if _norm_res(c) == want:
+                    return c
+        except Exception:
+            pass
+        return None
+
+    import re as _re2
+    _x = _rcol(x)
+    _y = _rcol(y)
+    _group = _rcol(spec.group_by)
+    # Top-N markers also come as plain "Top 10 by SUM(GROSS AMT)." (no
+    # "filter:" prefix) from the deterministic planner — trigger on either.
+    if notes and ("filter:" in notes or _re2.search(r"top\s+\d+\s+by\b", notes)):
+        # Top-N pre-filter: e.g. Top 5 by revenue or filter: region in_top_n 5 rank_by SUM(revenue).
+        # The rank capture allows SUM(...) with spaces ("SUM(GROSS AMT)").
+        m_top = _re2.search(r"top\s+(\d+)\s+by\s+(SUM\s*\([^)]*\)|[^\s;,\.]+)", notes, re.IGNORECASE)
+        if m_top:
+            try:
+                n_top = int(m_top.group(1))
+                rank_col = m_top.group(2).strip().strip("'\"")
+                # Resolve rank column name (strip SUM())
+                rank_col_clean = _re2.sub(r".*\((.*)\).*", r"\1", rank_col) if "(" in rank_col else rank_col
+                rank_col_clean = rank_col_clean.strip()
+                _rank_col = _rcol(rank_col_clean)
+                # Currency/text-stored rank columns ("$1,200") must be numeric
+                # before groupby().sum(), otherwise pandas concatenates strings.
+                if _rank_col:
+                    chunks.append(f"df[{_fg(_rank_col)}] = pd.to_numeric(df[{_fg(_rank_col)}].astype(str).str.replace(r'[\\$,%]', '', regex=True).str.strip(), errors='coerce')")
+                # For top-N, group by group_by if exists (e.g., top 5 Styles), otherwise x
+                rank_group = _group if _group else _x
+                # Also try to infer rank_group from filter text if x is temporal (month) but Style is intended
+                if rank_group and _rank_col:
+                    chunks.append(f"_rank = df.groupby({_fg(rank_group)})[{_fg(_rank_col)}].sum().nlargest({n_top}).index")
+                    chunks.append(f"df = df[df[{_fg(rank_group)}].isin(_rank)]")
+                elif rank_group:
+                    # Rank by y if rank_col not found but y exists
+                    y_for_rank = _rank_col or _y
+                    if y_for_rank:
+                        chunks.append(f"_rank = df.groupby({_fg(rank_group)})[{_fg(y_for_rank)}].sum().nlargest({n_top}).index")
+                        chunks.append(f"df = df[df[{_fg(rank_group)}].isin(_rank)]")
+                elif _rank_col and _y and _x:
+                    chunks.append(f"_rank = df.groupby({_fg(_x)})[{_fg(_rank_col)}].sum().nlargest({n_top}).index")
+                    chunks.append(f"df = df[df[{_fg(_x)}].isin(_rank)]")
+                elif _rank_col and _x:
+                    chunks.append(f"_rank = df.groupby({_fg(_x)})[{_fg(_rank_col)}].sum().nlargest({n_top}).index")
+                    chunks.append(f"df = df[df[{_fg(_x)}].isin(_rank)]")
+            except Exception:
+                pass
+        # Last N time filter: last 2 years / last_n 2 years
+        if "last" in notes.lower() and x and x in cols:
+            m_last = _re2.search(r"last\s+(\d+)\s+years?", notes, re.IGNORECASE)
+            if m_last:
+                try:
+                    n_years = int(m_last.group(1))
+                    chunks.append(f"df[{_fg(x)}] = pd.to_datetime(df[{_fg(x)}], errors='coerce')")
+                    chunks.append(f"df = df.dropna(subset=[{_fg(x)}])")
+                    chunks.append(f"_cutoff = df[{_fg(x)}].max() - pd.DateOffset(years={n_years})")
+                    chunks.append(f"df = df[df[{_fg(x)}] >= _cutoff]")
+                except Exception:
+                    pass
+        # Conditional: in list like quarter in ['Q1','Q4'] or year in [2023,2024]
+        # Handle generic spec.filter as well
     if spec.filter:
         cond = _translate_filter(spec.filter, df)
         if cond:
-            chunks.append(f"df = df[{cond[0]}] {cond[1]}]")
+            chunks.append(f"df = df[{cond[0]} {cond[1]}]")
 
     # --- data_notes: split / explode ---
     if "split" in notes or "comma" in notes or "explode" in notes:
@@ -143,6 +312,9 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
 
     if spec.chart_type == "histogram":
         col = x or y or cols[0]
+        # Handle string numeric like GROSS AMT with $, commas
+        chunks.append(f"df[{_fg(col)}] = pd.to_numeric(df[{_fg(col)}].astype(str).str.replace(r'[\\$,]', '', regex=True).str.replace(',', ''), errors='coerce')")
+        chunks.append(f"df = df.dropna(subset=[{_fg(col)}])")
         chunks.append(f"result = df[[{_fg(col)}]].dropna()")
         return "\n".join(chunks)
 
@@ -221,7 +393,101 @@ def _empty_df_for(profile: SheetProfile) -> pd.DataFrame:
     return pd.DataFrame(columns=[c.name for c in profile.columns])
 
 
-def _apply_edit(spec: ChartSpec, message: str, known_categories: list[str] | None = None) -> tuple[ChartSpec, str]:
+_QUOTED_COL_RE = re.compile(r"[`'\"\\]([^`'\"\\]+)[`'\"\\]")
+_METRIC_VERBS_RE = re.compile(
+    r"(?:change|switch|set|show|plot|display|sum|total|use|aggregate)\s+"
+    r"(?:the\s+)?(?:metric|measure|measures|values?|total|sum|y[\s-]?axis\s+)?"
+    r"(?:to|as|of)?\s*[`'\"\\]?([\w\s$%]{2,40}?)[`'\"\\]?\s*$",
+    re.IGNORECASE,
+)
+_DIM_VERBS_RE = re.compile(
+    r"(?:group\s+by|grouped\s+by|break\s+down\s+by|across|per|versus|\bvs\b|\bby\b)\s+"
+    r"(?:the\s+)?[`'\"\\]?([\w\s$%]{2,40}?)[`'\"\\]?\s*$",
+    re.IGNORECASE,
+)
+_TRAILING_CLAUSE_RE = re.compile(
+    r"\s+(instead.*|per\s+.*|by\s+.*|for\s+.*|across\s+.*|as\s+(?:a\s+)?(?:metric|measure|dimension).*)$",
+    re.IGNORECASE,
+)
+
+
+def _strip_trailing_clause(phrase: str) -> str:
+    return _TRAILING_CLAUSE_RE.sub("", (phrase or "").strip()).strip().strip("`'\"\\ ")
+
+
+def _apply_column_change(
+    spec: ChartSpec,
+    message: str,
+    column_names: list[str] | None = None,
+    role_map: dict[str, str] | None = None,
+) -> tuple[ChartSpec, str] | None:
+    """Metric/dimension change via the single resolver ("sum PCS instead").
+
+    Returns (new_spec, note) when the message names a real column with the
+    expected role and it differs from the current spec; else None (caller
+    falls through to the "no edit" reply). Quoted names win over verb
+    heuristics; role guards keep "group by Style" (dimension) and
+    "sum PCS" (metric) from cross-applying.
+    """
+    if not column_names:
+        return None
+    role_map = role_map or {}
+    try:
+        from viz.resolve import resolve_column as _rc
+    except Exception:
+        return None
+
+    metric_cands: list[str] = []
+    dim_cands: list[str] = []
+    for q in _QUOTED_COL_RE.findall(message):
+        q = q.strip()
+        if q:
+            metric_cands.append(q)
+            dim_cands.append(q)
+    mm = _METRIC_VERBS_RE.search(message)
+    if mm and mm.group(1).strip():
+        metric_cands.append(_strip_trailing_clause(mm.group(1)))
+    dm = _DIM_VERBS_RE.search(message)
+    if dm and dm.group(1).strip():
+        dim_cands.append(_strip_trailing_clause(dm.group(1)))
+
+    new_spec = spec.model_copy(deep=True)
+    notes: list[str] = []
+
+    for cand in metric_cands:
+        if not cand:
+            continue
+        col, score = _rc(cand, column_names, role_map, prefer_role="numeric")
+        if col and score >= 1.0 and role_map.get(col, "numeric") == "numeric" and col != spec.y:
+            new_spec.y = col
+            if (new_spec.agg_function or "sum") == "count":
+                new_spec.agg_function = "sum"
+            notes.append(f"Changed metric to '{col}'.")
+            break
+
+    for cand in dim_cands:
+        if not cand:
+            continue
+        col, score = _rc(cand, column_names, role_map, prefer_role="categorical")
+        if (col and score >= 1.0 and role_map.get(col) in ("categorical", "temporal")
+                and col != new_spec.x and col != new_spec.y):
+            new_spec.x = col
+            new_spec.group_by = None  # avoid stale grouping on the old dimension
+            notes.append(f"Changed dimension to '{col}'.")
+            break
+
+    if not notes:
+        return None
+    return new_spec, " ".join(notes)
+
+
+def _apply_edit(
+    spec: ChartSpec,
+    message: str,
+    known_categories: list[str] | None = None,
+    column_names: list[str] | None = None,
+    role_map: dict[str, str] | None = None,
+) -> tuple[ChartSpec, str]:
     """Interpret a follow-up message as a targeted edit to a chart spec."""
     msg = message.lower().strip()
 
@@ -289,8 +555,13 @@ def _apply_edit(spec: ChartSpec, message: str, known_categories: list[str] | Non
             return new_spec, "Showing every category under its real name (long-tail 'other' removed)."
         return spec, "Every category already shows its real name."
 
+    col_changed = _apply_column_change(spec, message, column_names, role_map)
+    if col_changed is not None:
+        return col_changed
+
     return spec, (
         "No edit applied. I can change the chart type (e.g. 'make it a bar'), "
+        "the metric (e.g. 'sum PCS instead'), the dimension (e.g. 'group by Style'), "
         "rename a label (e.g. 'rename other to group'), or show real category "
         "names ('show real names' / 'labels to group')."
     )
@@ -325,14 +596,34 @@ def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) 
     # --- observe -------------------------------------------------------------
     _ = inspect_data.inspect(profile)  # tool call #1: schema observation
 
+    # --- data-quality pre-scan (host-side, exact counts for the notes) -------
+    try:
+        _qrep = quarantine_report(df, spec.x)
+    except Exception:
+        _qrep = {"count": 0, "examples": []}
+    try:
+        _blanks = blank_row_count(df)
+    except Exception:
+        _blanks = 0
+
     last_error: str | None = None
     feedback: str | None = None
+    # Snapshot the planned x: deterministic codegen may rewrite spec.x to a
+    # derived `_time_bucket` column for chart building. Verification must run
+    # against the ORIGINAL column (it re-derives the bucket itself); using
+    # the mutated spec makes every bucketed chart fail with
+    # "Category column '_time_bucket' not found in the raw frame."
+    _verify_x = spec.x
     for attempt in range(MAX_ATTEMPTS):
         # --- think: write (or rewrite) the pandas snippet --------------------
-        if attempt_llm:
-            code = _codegen_llm(spec, profile, feedback)
-        else:
+        # Option A contract: deterministic codegen runs FIRST (reproducible,
+        # no concat/merge inventions). The LLM is a fallback for a failed
+        # deterministic attempt only, and attempt_llm=False disables it
+        # entirely. Either way the snippet is sandboxed + verified.
+        if attempt == 0 or not attempt_llm:
             code = _codegen_deterministic(spec, df)
+        else:
+            code = _codegen_llm(spec, profile, feedback)
 
         # --- act: sandboxed execution ----------------------------------------
         run_result = run_code.run_snippet(df, code)  # tool call #2
@@ -363,7 +654,13 @@ def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) 
             continue
 
         # --- verify: independent closed-form recomputation against the raw frame
-        verified, verification = create_chart.verify_computed(spec, df, chart.computed_summary)
+        # Use the pre-mutation x (see _verify_x): codegen may have rewritten
+        # spec.x to a derived bucket column that exists only in built_df.
+        _verify_spec = spec
+        if spec.x != _verify_x:
+            _verify_spec = spec.model_copy()
+            _verify_spec.x = _verify_x
+        verified, verification = create_chart.verify_computed(_verify_spec, df, chart.computed_summary)
 
         # --- semantic validation: verify result logic ---
         validation_result = validate_chart(spec, df, built_df, chart.computed_summary)
@@ -373,12 +670,26 @@ def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) 
         rec_specs = recommend_charts(spec, profile)
         rec_results = [ChartResult(spec=rs) for rs in rec_specs[1:]]  # specs only, not executed
 
+        # --- data-quality notes: what was excluded, with counts -------------
+        dq_notes: list[str] = []
+        if _qrep.get("count"):
+            _ex = ", ".join(f"'{e}'" for e in (_qrep.get("examples") or [])[:3])
+            dq_notes.append(
+                f"Excluded {_qrep['count']} misaligned month-like values from "
+                f"'{spec.x}' (e.g. {_ex}) — source rows stored under the wrong column."
+            )
+        if _blanks:
+            dq_notes.append(f"Ignored {_blanks} fully-blank source rows.")
+        _adapt = chart.adaptation_note or ""
+        if dq_notes:
+            _adapt = (_adapt + " " if _adapt else "") + " ".join(dq_notes)
+
         return ChartResult(
             spec=spec,
             figure_json=chart.figure_json,
             computed_summary=chart.computed_summary,
             figure_data=chart.figure_data,
-            adaptation_note=chart.adaptation_note,
+            adaptation_note=_adapt or None,
             verified=verified,
             verification=verification,
             recommendations=rec_results,
@@ -433,7 +744,27 @@ def reexecute_spec(
             if v is not None and not isinstance(v, bool):
                 known.append(str(v))
     known = list(dict.fromkeys(known))
-    spec, note = _apply_edit(target.spec, message, known_categories=known)
+    # Column inventory + live roles so refine can change metric/dimension
+    # ("sum PCS instead", "group by Style") via the single resolver.
+    column_names: list[str] | None = None
+    role_map: dict[str, str] | None = None
+    try:
+        from viz.profiler import profile_data as _profile_data
+
+        _prof = workbook.profile_for(target.spec.sheet)
+        _dprof = _profile_data(_prof, workbook.frames.get(target.spec.sheet))
+        column_names = _dprof.column_names()
+        role_map = {c.name: c.role for c in _dprof.columns}
+    except Exception:
+        try:
+            _prof = workbook.profile_for(target.spec.sheet)
+            column_names = [c.name for c in _prof.columns]
+        except Exception:
+            pass
+    spec, note = _apply_edit(
+        target.spec, message, known_categories=known,
+        column_names=column_names, role_map=role_map,
+    )
     new_result = execute_spec(spec, workbook, attempt_llm=attempt_llm)
     results = list(results)
     results[index] = new_result

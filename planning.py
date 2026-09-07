@@ -12,32 +12,12 @@ from __future__ import annotations
 import re
 from typing import Sequence
 
-from llm import LLMError, llm_structured
-from schemas import ChartSpec, ChartSpecList, SheetProfile
+from schemas import ChartSpec, SheetProfile
 from tools.rule_engine import apply_rules
+from viz.resolve import looks_numeric_samples
+from viz.resolve import score_query as _resolve_score
 
-PLAN_SYSTEM_PROMPT = (
-    "You turn a data analyst's plain-English visualization guideline into structured chart "
-    "specifications. You are given a schema summary and a list of guideline lines.\n\n"
-    "CRITICAL: Multiple lines often describe DIFFERENT ASPECTS of the SAME chart. "
-    "Analyze ALL lines together. When lines share the same topic, entities, or metrics, "
-    "combine them into ONE ChartSpec that satisfies every requirement.\n\n"
-    "Follow this reasoning for each distinct chart intent:\n"
-    "1. Understand entities: what data subjects are mentioned?\n"
-    "2. Business meaning: what question is being answered?\n"
-    "3. Choose metric: what column is being measured? (sum, count, count-distinct, etc.)\n"
-    "4. Choose dimension: what column is the categorical axis?\n"
-    "5. Data quality: are there special handling needs (e.g. split comma-separated values, "
-    "filter nulls, count distinct)? Put these in the data_notes field.\n"
-    "6. Choose visualization: pick the best chart type. Use explicit instructions when given; "
-    "otherwise infer (time -> line, category comparison -> bar, part-of-whole -> pie, "
-    "numeric relationship -> scatter, ranking -> horizontal_bar).\n"
-    "7. Sorting/ranking: apply sort order and top-N limits from the guideline.\n\n"
-    "Match guideline terms to actual column names from the schema -- never invent columns. "
-    "If you cannot map a term, set status='skipped' with a clear skip_reason."
-)
-
-# --- deterministic fallback matching ----------------------------------------
+# --- deterministic matching ---------------------------------------------------
 
 SYNONYMS: dict[str, set[str]] = {
     "revenue": {"revenue", "sales", "total", "gross", "income", "amount", "turnover", "receipt"},
@@ -147,15 +127,109 @@ def _detect_agg(line: str) -> str:
     return "sum"
 
 
+_HOW_MANY_RE = re.compile(
+    r"how\s+many\s+([A-Za-z0-9][A-Za-z0-9 _\-]*?)"
+    r"(?:\s+did\b|\s+does\b|\s+do\b|\s+by\b|\s+for\b|\s+in\b|\s+per\b|\s+of\b|\?|$)",
+    re.IGNORECASE,
+)
+_QUARTER_GUARD = re.compile(r"\bQ[1-4]\b", re.IGNORECASE)
+
+
+def _union_measure_cols(data_profiles) -> list[str]:
+    """Numeric-measure column names across sheets (sample-aware, not dtype-only)."""
+    seen: list[str] = []
+    for p in data_profiles or []:
+        for c in p.columns:
+            if c.name not in seen and _is_measure_col(c):
+                seen.append(c.name)
+    return seen
+
+
+def _resolve_measure_for_text(text: str, data_profiles) -> str | None:
+    """Best numeric measure for a clause, or None.
+
+    Applies the "how many <noun>" rule first ("how many units" -> SUM(PCS),
+    never COUNT(*)), then per-word resolver scoring over numeric candidates.
+    """
+    cols = _union_measure_cols(data_profiles)
+    if not cols or not (text or "").strip():
+        return None
+    hm = _HOW_MANY_RE.search(text)
+    candidates = [hm.group(1).strip()] if hm and hm.group(1).strip() else []
+    # score both the how-many noun (when present) and the full clause
+    texts = candidates + [text] if candidates else [text]
+    best, best_score = None, 0.0
+    for t in texts:
+        for c in cols:
+            s = _resolve_score(t, c)
+            if s > best_score:
+                best, best_score = c, s
+    return best if best_score >= 1.0 else None
+
+
+def _split_dual_clauses(group: list[str], data_profiles) -> dict | None:
+    """Split one guideline group into two single-measure clauses.
+
+    "Top 10 customers by revenue, AND how many units did each buy" carries
+    two measures sharing one dimension + top-N context. The deterministic
+    planner otherwise merges them into a single COUNT(*) chart.
+    Returns None unless the text splits cleanly into exactly two parts that
+    resolve to DIFFERENT numeric measures; then
+    {"parts": [(clause, measure), ...], "top_n": int|None,
+     "rank_measure": measure|None}.
+    """
+    text = " ".join(g.strip() for g in group if g and g.strip())
+    if not text or " and " not in text.lower():
+        return None
+    parts = re.split(r"\s+and\s+", text, flags=re.IGNORECASE)
+    if len(parts) != 2:
+        return None
+    p1 = parts[0].strip().strip(" |,:;")
+    p2 = parts[1].strip().strip(" |,:;")
+    if len(p1) < 10 or len(p2) < 10:
+        return None
+    # "Q1 and Q4" style filter comparisons are not dual metrics.
+    if _QUARTER_GUARD.search(p1) and _QUARTER_GUARD.search(p2):
+        return None
+    m1 = _resolve_measure_for_text(p1, data_profiles)
+    m2 = _resolve_measure_for_text(p2, data_profiles)
+    if not m1 or not m2 or m1 == m2:
+        return None
+    top_n, rank_measure = None, None
+    for part, m in ((p1, m1), (p2, m2)):
+        mt = _TOPN_PATTERN.search(part)
+        if mt:
+            top_n, rank_measure = int(mt.group(1)), m
+            break
+    return {"parts": [(p1, m1), (p2, m2)], "top_n": top_n, "rank_measure": rank_measure}
+
+
+def _is_measure_col(col) -> bool:
+    """A column usable as a numeric measure.
+
+    Raw-dtype check alone hides text-stored measures (currency "$1,200",
+    percents, comma-grouped numbers parsed as object) — the profiler already
+    treats those as numeric via samples, so the planner must too.
+    Bare row-id columns ("index") are never measures, even with int dtype.
+    """
+    _idx_like = {"index", "idx", "row_number", "rownumber", "level_0"}
+    _nm = _norm(getattr(col, "name", ""))
+    if _nm in _idx_like or _nm.startswith("unnamed"):
+        return False
+    if col.dtype in ("int64", "int32", "float64", "float32", "Int64", "Float64"):
+        return True
+    return looks_numeric_samples(getattr(col, "sample_values", None))
+
+
 def _find_measure_column(line: str, profile: SheetProfile, exclude: set[str]) -> str | None:
     """Best numeric column for the measure, excluding already-chosen ones."""
     best_col, best_score = None, 0.0
     for col in profile.columns:
         if col.name in exclude:
             continue
-        if col.dtype not in ("int64", "int32", "float64", "float32", "Int64", "Float64"):
+        if not _is_measure_col(col):
             continue
-        score = _column_score(line, col.name) + _synonym_score(line, col.name)
+        score = _resolve_score(line, col.name)
         if score > best_score:
             best_col, best_score = col.name, score
     return best_col or _fallback_numeric(profile, exclude)
@@ -163,9 +237,7 @@ def _find_measure_column(line: str, profile: SheetProfile, exclude: set[str]) ->
 
 def _fallback_numeric(profile: SheetProfile, exclude: set[str]) -> str | None:
     for col in profile.columns:
-        if col.name not in exclude and col.dtype in (
-            "int64", "int32", "float64", "float32", "Int64", "Float64",
-        ):
+        if col.name not in exclude and _is_measure_col(col):
             return col.name
     return None
 
@@ -198,9 +270,9 @@ def _is_measure_term(line: str) -> bool:
 def _best_numeric(line: str, prof: SheetProfile, exclude: set[str]) -> tuple[str | None, float]:
     best, best_score = None, 0.0
     for col in prof.columns:
-        if col.name in exclude or col.dtype not in NUMERIC_DTYPES:
+        if col.name in exclude or not _is_measure_col(col):
             continue
-        sc = _column_score(line, col.name) + _synonym_score(line, col.name)
+        sc = _resolve_score(line, col.name)
         if sc > best_score:
             best, best_score = col.name, sc
     return best, best_score
@@ -209,7 +281,7 @@ def _best_numeric(line: str, prof: SheetProfile, exclude: set[str]) -> tuple[str
 def _best_category(line: str, prof: SheetProfile, exclude: set[str]) -> tuple[str | None, float]:
     best, best_score = None, 0.0
     for col in prof.columns:
-        if col.name in exclude or col.dtype in NUMERIC_DTYPES:
+        if col.name in exclude or _is_measure_col(col):
             continue
         sc = _column_score(line, col.name) + _synonym_score(line, col.name)
         if sc > best_score:
@@ -526,10 +598,27 @@ def deterministic_plan(profiles: list[SheetProfile], lines: Sequence[str]) -> li
 
     groups, anchor = _group_lines_by_intent(lines, data_profiles)
 
-    for idx, group in enumerate(groups, start=1):
+    # Expand dual-metric questions ("top 10 by revenue, AND how many units")
+    # into two single-measure groups sharing one top-N context, so each
+    # measure becomes its own chart instead of collapsing to COUNT(*).
+    expanded: list[tuple[list[str], dict | None]] = []
+    for grp in groups:
+        split = _split_dual_clauses(grp, data_profiles)
+        if split:
+            for clause, measure in split["parts"]:
+                expanded.append(([clause], {
+                    "measure": measure,
+                    "top_n": split["top_n"],
+                    "rank_measure": split["rank_measure"],
+                    "title": re.sub(r"\s+", " ", clause).strip()[:90],
+                }))
+        else:
+            expanded.append((grp, None))
+
+    for idx, (group, dual_ctx) in enumerate(expanded, start=1):
         merged_line = _merge_group_to_line(group)
         data_notes = _detect_data_notes(group)
-        title_line = group[0]
+        title_line = (dual_ctx or {}).get("title") or group[0]
 
         # Detect user-explicitly-named columns PER GROUP (not globally)
         explicit_dim, explicit_metric = _find_explicit_columns(group, data_profiles)
@@ -586,6 +675,22 @@ def deterministic_plan(profiles: list[SheetProfile], lines: Sequence[str]) -> li
         else:
             agg = _detect_agg(merged_line)
             measure, _ = _best_numeric(merged_line, prof, set())
+            # "how many <noun>" with a resolvable numeric measure means
+            # SUM(metric) ("how many units" -> SUM(PCS)), never COUNT(*).
+            # Bare "how many" (no measure) keeps agg=count.
+            if agg == "count":
+                hm = _resolve_measure_for_text(merged_line, [prof])
+                if hm:
+                    measure, agg = hm, "sum"
+
+        # Dual-metric clause: its own resolved measure wins (backtick-explicit
+        # columns still take priority), so "…by revenue, and how many units…"
+        # yields one chart per measure instead of one COUNT(*) chart.
+        if (dual_ctx and not explicit_metric
+                and dual_ctx.get("measure") in [c.name for c in prof.columns]):
+            measure = dual_ctx["measure"]
+            if _HOW_MANY_RE.search(merged_line):
+                agg = "sum"
 
         x_col, y_col = None, None
 
@@ -645,6 +750,7 @@ def deterministic_plan(profiles: list[SheetProfile], lines: Sequence[str]) -> li
                         agg = "count"
                     x_col, y_col = cat_col, None
                 else:
+                    _avail = ", ".join(c.name for c in prof.columns)
                     specs.append(
                         ChartSpec(
                             id=f"spec_{idx}", sheet=prof.sheet_name, chart_type=ctype,
@@ -654,13 +760,28 @@ def deterministic_plan(profiles: list[SheetProfile], lines: Sequence[str]) -> li
                             skip_reason=(
                                 f"Could not map the measure term in '{title_line}' to any numeric "
                                 "column in the schema; the closest category column is "
-                                f"'{cat_col}'."
+                                f"'{cat_col}'. Available columns: {_avail}."
                             ),
                         )
                     )
                     continue
             else:
                 x_col, y_col = cat_col, measure
+
+        # Shared top-N context for dual-metric clauses: both charts rank by the
+        # same metric ("top 10 by revenue"), so the PCS chart shows the units
+        # of the top-revenue customers instead of the top-by-PCS customers.
+        # The agent's Top-N pushdown reads the data_notes marker + filter.
+        dual_filter = None
+        if (dual_ctx and dual_ctx.get("top_n") and dual_ctx.get("rank_measure")
+                and dual_ctx["rank_measure"] in [c.name for c in prof.columns]
+                and x_col):
+            n = dual_ctx["top_n"]
+            rank = dual_ctx["rank_measure"]
+            marker = f" Top {n} by SUM({rank})."
+            if marker.strip().lower() not in (data_notes or "").lower():
+                data_notes = ((data_notes or "") + marker).strip()
+            dual_filter = f"{x_col} in_top_n {n} rank_by SUM({rank})"
 
         title = re.sub(r"\s+", " ", title_line).strip()[:90] or f"Chart {idx}"
         spec = ChartSpec(
@@ -670,6 +791,7 @@ def deterministic_plan(profiles: list[SheetProfile], lines: Sequence[str]) -> li
             title=title,
             x=x_col,
             y=y_col,
+            filter=dual_filter,
             agg_function=agg,
             data_notes=data_notes,
             status="planned",
@@ -742,41 +864,11 @@ def recommend_charts(spec: ChartSpec, profile: SheetProfile) -> list[ChartSpec]:
     return recommendations
 
 
-# --- LLM path ----------------------------------------------------------------
-
-def _build_user_prompt(profiles: list[SheetProfile], lines: Sequence[str]) -> str:
-    blocks = []
-    for p in profiles:
-        cols = []
-        for c in p.columns:
-            cols.append(
-                f"- {c.name} (dtype {c.dtype}, {c.null_count} null, {c.unique_count} unique, "
-                f"samples: {', '.join(c.sample_values[:3]) or 'n/a'})"
-            )
-        blocks.append(f"Sheet '{p.sheet_name}': {p.row_count} rows\n" + "\n".join(cols))
-    schema_summary = "\n\n".join(blocks)
-    lines_txt = "\n".join(f"{i+1}. {ln}" for i, ln in enumerate(lines))
-    return (
-        "Spreadsheet schema summary:\n"
-        f"{schema_summary}\n\n"
-        "Guideline lines (multiple lines may describe the same chart -- combine them into ONE "
-        "spec when they share the same topic, entities, or metrics):\n"
-        f"{lines_txt}\n\n"
-        "Return a JSON object: {\"specs\": [<ChartSpec>, ...]}. "
-        "Use exactly the column names listed above. Chart types: line, bar, horizontal_bar, pie, "
-        "scatter. For skipped items set \"status\": \"skipped\" and explain skip_reason. "
-        "Sets an appropriate agg_function (sum/mean/count/etc.). Do not reference an "
-        "instructions/guideline sheet as data."
-    )
-
-
-def _llm_plan(profiles: list[SheetProfile], lines: Sequence[str]) -> list[ChartSpec]:
-    user = _build_user_prompt(profiles, lines)
-    try:
-        out = llm_structured(PLAN_SYSTEM_PROMPT, user, ChartSpecList)
-    except LLMError:
-        raise
-    return list(out.specs)
+# --- LLM-direct planning removed (Option A contract) ---------------------------
+# A structured LLM plan could name plausible-but-wrong existing columns
+# (DATE for CUSTOMER) that post-validation cannot catch. Planning is
+# deterministic-only; the LLM remains advisory for intent goals
+# (viz/intent.py) and narrative (narrative.py).
 
 
 # --- post-validation (applies to both paths) ---------------------------------
@@ -812,12 +904,28 @@ def _ensure_valid_specs(specs: list[ChartSpec], profiles: list[SheetProfile]) ->
             continue
 
         col_names = [c.name for c in by_name[spec.sheet].columns]
+        # Normalize group_by coherence before missing check (fix orchestrator hallucinated group_by)
+        GROUP_AWARE = {"grouped_bar", "stacked_bar", "stacked_100", "line", "area", "scatter", "heatmap", "boxplot"}
+        if spec.group_by and spec.group_by in (spec.x, spec.y):
+            spec.group_by = None
+        if spec.chart_type in ("bar", "horizontal_bar", "pie", "donut", "histogram") and spec.group_by is not None:
+            spec.group_by = None
+        if spec.group_by and spec.group_by not in col_names:
+            # Ignore invalid group_by gracefully for non-grouped charts, else skip
+            if spec.chart_type in GROUP_AWARE:
+                missing.append("group_by")
+            else:
+                spec.group_by = None
         missing = [label for label, val in fields if val and val not in col_names]
         if missing:
-            spec.status = "skipped"
-            spec.skip_reason = f"Referenced column(s) not found in sheet '{spec.sheet}': {', '.join(missing)}."
-            out.append(spec)
-            continue
+            # For group_by only, clear it instead of skipping if not required
+            if missing == ["group_by"] and spec.chart_type not in GROUP_AWARE:
+                spec.group_by = None
+            else:
+                spec.status = "skipped"
+                spec.skip_reason = f"Referenced column(s) not found in sheet '{spec.sheet}': {', '.join(missing)}."
+                out.append(spec)
+                continue
         # Charts without an x-axis are not meaningful.
         if spec.chart_type == "pie" and not spec.y and spec.agg_function != "count":
             spec.y = col_names[0]
@@ -836,22 +944,92 @@ def _is_instructions_sheet(name: str) -> bool:
 
 
 def plan_charts(profiles: list[SheetProfile], lines: Sequence[str], frames: dict | None = None) -> list[ChartSpec]:
-    """End-to-end planning: LLM structured call (fallback to Viz Intelligence)."""
+    """End-to-end planning (Option A contract): deterministic-first.
+
+    The orchestrator resolves columns/chart shape through deterministic
+    machinery (single resolver, gates, scoring); the LLM is advisory-only
+    (intent goals, narrative) and never supplies column names. There is no
+    LLM-direct plan fallback: a question the deterministic layers reject is
+    returned as an explained skip, never an invented chart. Up to 2 charts
+    per request (dual-And); anything more is rejected transparently.
+    """
     data_profiles = [p for p in profiles if p.columns and not _is_instructions_sheet(p.sheet_name)]
-    specs: list[ChartSpec] | None = None
-    # Try LLM first
+    # Enforce one-request-at-a-time: if caller sent one question, keep exactly one line (do not split into multiple intents/charts)
+    # The intent layer also enforces this, but keep lines intact here.
+    if len(lines) == 1:
+        line = lines[0].strip()
+        if line:
+            lines = [line]
+
+    # Primary: Viz Intelligence orchestrator which now does LLM-first intent extraction → data-driven scoring → k=1 selection
+    # This satisfies: LLM for understanding + deterministic fallback, data-driven chart selection
     try:
-        specs = _llm_plan(data_profiles, lines)
-    except LLMError:
-        specs = None
-    if specs is None:
-        # Use new Viz Intelligence orchestrator (profiler → intent → candidates → gates → scoring → ranking)
+        from viz.orchestrator import orchestrate
+        specs = orchestrate(profiles, frames, list(lines))
+        # If orchestrator returns valid planned specs (single optimal), return them
+        if specs and any(s.status == "planned" for s in specs):
+            return _ensure_valid_specs(specs, profiles)
+        # Orchestrator rejected everything: return the explained skips as-is.
+        # No LLM-direct fallback by contract (it invents columns).
+        if specs and all(s.status == "skipped" for s in specs):
+            return _ensure_valid_specs(specs, profiles)
+        if specs:
+            return _ensure_valid_specs(specs, profiles)
+        # Empty → fallback
+    except Exception:
+        pass
+
+    # Fallback: deterministic keyword-lightweight plan (synonyms kept lightweight)
+    specs = deterministic_plan(data_profiles, lines)
+    # Ask mode with several planned deterministic candidates: keep the best
+    # TWO distinct ones (dual-And needs 2; anything more is trimmed).
+    if len(lines) == 1 and len([s for s in specs if s.status == "planned"]) > 1:
+        # Use scoring to pick best among deterministic candidates
         try:
-            from viz.orchestrator import orchestrate
-            specs = orchestrate(profiles, frames, list(lines))
-            # orchestrator already returns validated specs; if empty, fallback to deterministic_plan
-            if not specs:
-                specs = deterministic_plan(data_profiles, lines)
+            from viz.profiler import profile_data
+            from viz.intent import parse_intents
+            from viz.scoring import score_candidate
+            from viz.gates.can import can_gate
+            from viz.gates.appropriate import appropriate_gate
+            from viz.gates.useful import useful_gate
+            intents = parse_intents(list(lines), profiles)
+            goal = intents[0].goal if intents else "comparison"
+            # Score deterministically generated specs
+            for prof in data_profiles:
+                df = frames.get(prof.sheet_name) if frames else None
+                dprof = profile_data(prof, df)
+                scored = []
+                for s in specs:
+                    if s.status != "planned":
+                        continue
+                    if not can_gate(s, dprof).passed:
+                        continue
+                    if not appropriate_gate(s, dprof).passed:
+                        continue
+                    if not useful_gate(s, dprof, goal).passed:
+                        continue
+                    sc, _, _ = score_candidate(s, dprof, goal, False)
+                    scored.append((sc, s))
+                if scored:
+                    scored.sort(key=lambda x: x[0], reverse=True)
+                    # Keep the best TWO distinct specs (dual-And needs both;
+                    # extra accidental multiples are trimmed).
+                    kept: list = []
+                    seen: set = set()
+                    for _, s in scored:
+                        key = (s.chart_type, s.x, s.y, s.group_by)
+                        if key not in seen:
+                            seen.add(key)
+                            kept.append(s)
+                        if len(kept) >= 2:
+                            break
+                    # Return kept + any skipped for transparency
+                    skipped = [s for s in specs if s.status == "skipped"]
+                    specs = kept + skipped
+                    break
         except Exception:
-            specs = deterministic_plan(data_profiles, lines)
+            # Keep first planned specs if scoring fails (up to 2 for duals)
+            planned = [s for s in specs if s.status == "planned"]
+            skipped = [s for s in specs if s.status == "skipped"]
+            specs = (planned[:2] + skipped) if planned else specs
     return _ensure_valid_specs(specs, profiles)

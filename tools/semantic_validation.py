@@ -13,6 +13,8 @@ Verifies that computed results make logical sense:
 
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 
 from schemas import ChartSpec
@@ -154,9 +156,17 @@ def _check_bar_totals(
     if (result_df[val_col] < 0).any():
         result.add_warning("Bar chart contains negative values.")
 
-    # Verify sum matches source total for count aggregation
+    # Verify sum matches source total for count aggregation.
+    # Skipped for Top-N charts: a top-10 subset sum can never equal the full
+    # source row count, so the comparison is a false positive by construction
+    # (e.g. top-10 customers' 19184 rows vs 37432 total rows).
     agg = spec.agg_function or "sum"
-    if agg == "count":
+    notes = (spec.data_notes or "").lower()
+    is_topn = bool(
+        re.search(r"top\s+\d+", notes)
+        or (spec.filter and "in_top_n" in spec.filter.lower())
+    )
+    if agg == "count" and not is_topn:
         source_total = len(source_df)
         if bars_sum != source_total:
             result.add_warning(

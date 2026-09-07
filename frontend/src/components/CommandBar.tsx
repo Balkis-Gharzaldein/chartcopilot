@@ -102,6 +102,9 @@ function generateSuggestions(profiles: any[]): string[] {
 
 export function CommandBar() {
   const { workbookId, setResults, profiles } = useStore()
+  const setGenerating = (useStore as any)((s: any) => s.setGenerating as (v: boolean) => void)
+  const addToast = (useStore as any)((s: any) => s.addToast as (m: string, k?: string) => void)
+  const isGenerating = (useStore as any)((s: any) => s.isGenerating as boolean)
   const [text, setText] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -118,14 +121,18 @@ export function CommandBar() {
       ? lines[0].split(/[.]+/).map(s=>s.trim()).filter(Boolean)
       : lines
     setLoading(true)
+    setGenerating?.(true)
     setError(null)
     try {
       const plan = await api.plan(workbookId!, effective)
       const exec = await api.execute(workbookId!)
       setResults(exec.results, plan.specs, exec.narrative)
+      addToast?.(`Generated ${exec.results.filter((r: any) => r.figure_json).length} chart(s)`, 'success')
     } catch (e: any) {
-      setError(e.message || 'Failed to generate')
-    } finally { setLoading(false) }
+      const msg = e.message || 'Chart generation failed'
+      setError(msg)
+      addToast?.(msg, 'error')
+    } finally { setLoading(false); setGenerating?.(false) }
   }
 
   return (
@@ -153,11 +160,23 @@ export function CommandBar() {
         </div>
         {error && <div className="mt-2 text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</div>}
         <div className="mt-2 flex flex-wrap gap-1.5">
-          {suggestions.map(s => (
-            <button key={s} onClick={() => setText(s)} className="text-xs px-2.5 py-1 rounded-full bg-zinc-100 hover:bg-zinc-200 text-zinc-700">
-              {s}
-            </button>
-          ))}
+          {isGenerating ? (
+            <>
+              <div className="h-6 w-28 rounded-full shimmer" />
+              <div className="h-6 w-32 rounded-full shimmer" />
+              <div className="h-6 w-24 rounded-full shimmer" />
+            </>
+          ) : (
+            suggestions.map(s => (
+              <button
+                key={s}
+                onClick={() => setText(s)}
+                className="chip-lift text-xs px-2.5 py-1 rounded-full bg-zinc-100 hover:bg-zinc-200 text-zinc-700 border border-transparent"
+              >
+                {s}
+              </button>
+            ))
+          )}
         </div>
       </div>
     </div>

@@ -24,6 +24,7 @@ export const api = {
     return d as { workbook_id: string; filename: string; profiles: any[]; sheet_names: string[]; llm_available: boolean }
   },
   getWorkbook: (id: string) => jfetch(`/api/workbooks/${id}`),
+  getDataProfile: (id: string) => jfetch(`/api/workbooks/${id}/data-profile`) as Promise<Record<string, any>>,
   guideline: (id: string, text_area: string = '') => jfetch(`/api/workbooks/${id}/guideline`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text_area }),
   }),

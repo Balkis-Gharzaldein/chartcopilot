@@ -3,3 +3,105 @@
 * { scrollbar-width: thin; }
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-thumb { background: #d4d4d8; border-radius: 999px; }
+
+/* Global polish — lightweight CSS only, no heavy deps */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, #f4f4f5 25%, #e4e4e7 37%, #f4f4f5 63%);
+  background-size: 400% 100%;
+  animation: shimmer 1.2s ease-in-out infinite;
+}
+@keyframes verifiedPulse {
+  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(16,185,129,0.35); }
+  50% { transform: scale(1.04); box-shadow: 0 0 0 6px rgba(16,185,129,0); }
+  100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(16,185,129,0); }
+}
+.verified-pulse {
+  animation: verifiedPulse 0.6s ease-out 1;
+}
+@keyframes fadeSlideIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.fade-slide {
+  animation: fadeSlideIn 0.26s ease-out both;
+}
+@keyframes barGrow {
+  from { transform: scaleY(0); opacity: 0.6; }
+  to { transform: scaleY(1); opacity: 1; }
+}
+.bar-grow {
+  transform-origin: bottom;
+  animation: barGrow 0.52s ease-out both;
+}
+@keyframes lineDraw {
+  from { clip-path: inset(0 100% 0 0); opacity: 0.7; }
+  to { clip-path: inset(0 0 0 0); opacity: 1; }
+}
+.line-draw {
+  animation: lineDraw 0.58s ease-out both;
+}
+
+/* Suggestion chip polish */
+.chip-lift {
+  transition: transform 0.14s ease, box-shadow 0.14s ease, background-color 0.14s ease;
+}
+.chip-lift:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 10px rgba(0,0,0,0.08);
+}
+.chip-lift:active {
+  transform: scale(0.97);
+}
+
+/* Upload zone scale feedback */
+.upload-scale {
+  transition: transform 0.16s ease, border-color 0.16s ease, background-color 0.16s ease;
+}
+
+/* Dashboard specific */
+.dashboard-bg {
+  background: #F1F5F9;
+}
+.sidebar-bg {
+  background: #0F172A;
+}
+.card-shadow {
+  box-shadow: 0 1px 3px rgba(15,23,42,0.06), 0 4px 12px rgba(15,23,42,0.04);
+}
+.kpi-card {
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.kpi-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(15,23,42,0.08);
+}
+
+/* Sticky header utility — professional fixed header while scrolling */
+.sticky-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: rgba(248,250,252,0.95);
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid #e2e8f0;
+  box-shadow: 0 1px 0 0 rgba(0,0,0,0.06);
+}
+
+/* Respect reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  .shimmer,
+  .verified-pulse,
+  .fade-slide,
+  .bar-grow,
+  .line-draw,
+  .chip-lift,
+  .upload-scale,
+  .kpi-card {
+    animation: none !important;
+    transition: none !important;
+  }
+}
