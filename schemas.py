@@ -70,6 +70,9 @@ class ChartSpec(BaseModel):
     data_notes: str | None = None  # special data handling (e.g. "split comma-separated values")
     status: Literal["planned", "skipped"] = "planned"
     skip_reason: str | None = None  # required if status == "skipped"
+    confidence: float = 1.0
+    uncertain: bool = False
+    clarification: str | None = None
 
     @model_validator(mode="after")
     def _skip_needs_reason(self) -> "ChartSpec":
@@ -103,6 +106,8 @@ class ChartResult(BaseModel):
     verification: dict = Field(default_factory=dict)  # per-check results
     recommendations: list["ChartResult"] = Field(default_factory=list)  # related chart suggestions
     validation: dict = Field(default_factory=dict)  # semantic validation results
+    execution_error: str | None = None
+    execution_error_category: str | None = None
 
     @property
     def skipped(self) -> bool:

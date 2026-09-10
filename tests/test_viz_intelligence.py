@@ -15,6 +15,8 @@ from viz.gates.appropriate import appropriate_gate
 from viz.scoring import score_candidate
 from schemas import ChartSpec
 from ingestion import Workbook
+from agent import execute_plan
+from planning import plan_charts
 
 def _make_profile(df: pd.DataFrame, name="data") -> tuple[SheetProfile, DataProfile, Workbook]:
     # Build SheetProfile via profiler helper
@@ -44,6 +46,71 @@ def test_categorical_numeric():
     # pie should be allowed for 3 cats
     specs2 = orchestrate([prof], wb.frames, ["Show share of region as pie chart"])
     assert any(s.chart_type in ("pie","donut") and s.status=="planned" for s in specs2)
+
+def test_amazon_fulfillment_and_city_requests_resolve_semantically():
+    df = pd.DataFrame({
+        "Fulfilment": ["Amazon", "Merchant"] * 20,
+        "fulfilled-by": [None, "Easy Ship"] * 20,
+        "Sales Channel": ["Amazon.in"] * 40,
+        "ship-city": ["Mumbai", "Delhi"] * 20,
+        "Amount": range(40),
+    })
+    prof, _, wb = _make_profile(df)
+
+    fulfillment = orchestrate(
+        [prof], wb.frames,
+        ["Compare revenue and order counts between Amazon-fulfilled and merchant-fulfilled orders."],
+    )
+    assert fulfillment[0].x == "Fulfilment"
+    assert fulfillment[0].y == "Amount"
+    assert fulfillment[0].agg_function == "sum"
+
+    cities = orchestrate([prof], wb.frames, ["Show the top 20 cities by total revenue."])
+    assert cities[0].x == "ship-city"
+    assert cities[0].y == "Amount"
+
+def test_average_order_value_by_b2b_verifies():
+    df = pd.DataFrame({
+        "B2B": [True, False, True, False] * 5,
+        "Amount": [100, 200, 300, 400] * 5,
+    })
+    prof, _, wb = _make_profile(df)
+    specs = orchestrate([prof], wb.frames, ["Compare average order value between B2B and non-B2B orders."])
+    assert specs[0].x == "B2B"
+    assert specs[0].y == "Amount"
+    assert specs[0].agg_function == "mean"
+    result = execute_plan(wb, specs, attempt_llm=False)[0]
+    assert result.figure_json and result.verified, result.verification
+
+def test_ambiguous_measure_requests_clarification():
+    df = pd.DataFrame({
+        "date": pd.date_range("2024-01-01", periods=20),
+        "sales": range(20),
+        "profit": range(20, 40),
+    })
+    prof, _, wb = _make_profile(df)
+    specs = plan_charts([prof], ["Show trend over time"], frames=wb.frames)
+    assert specs[0].status == "skipped"
+    assert specs[0].clarification
+    assert "measure" in specs[0].clarification.lower()
+
+def test_courier_status_distribution_uses_categorical_counts():
+    df = pd.DataFrame({
+        "Status": ["Shipped", "Cancelled", "Shipped", "Shipped - Delivered to Buyer"],
+        "Courier Status": ["Shipped", None, "Unshipped", "Shipped"],
+    })
+    prof, _, wb = _make_profile(df)
+    specs = plan_charts(
+        [prof],
+        ["Create a chart showing courier status distribution for shipped orders"],
+        frames=wb.frames,
+    )
+    assert specs[0].x == "Courier Status"
+    assert specs[0].agg_function == "count"
+    assert "Filter shipped orders" in (specs[0].data_notes or "")
+    result = execute_plan(wb, specs, attempt_llm=False)[0]
+    assert result.figure_json and result.verified, result.verification
+    assert not any("does not match source row count" in warning for warning in result.validation.get("warnings", []))
 
 def test_multi_categorical():
     df = pd.DataFrame({

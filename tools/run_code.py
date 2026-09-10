@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -50,7 +51,16 @@ DANGEROUS_ATTRS = {
     "to_clipboard", "to_gbq", "to_feather", "to_stata",
     "eval", "query",  # pandas eval/query bypass the AST restrictions
     "mro", "subclasses",
+    # OS/network access reachable through imported libraries (including
+    # pandas compatibility and IO modules).
+    "os", "sys", "subprocess", "socket", "system", "popen", "spawn",
+    "environ", "path", "listdir", "getcwd", "chdir", "makedirs",
+    "remove", "unlink", "connect", "request", "urlopen",
     "__reduce__", "__getstate__", "__setstate__",
+}
+
+PANDAS_BLOCKED_NAMESPACES = {
+    "compat", "io", "core", "_libs", "util", "options", "config", "tests",
 }
 
 DANGEROUS_NAMES = {
@@ -105,6 +115,36 @@ SAFE_BUILTINS: dict[str, object] = {
 }
 
 
+class _PandasFacade:
+    """Small pandas surface needed by generated chart snippets.
+
+    Exposing the full pandas module lets snippets reach modules imported by
+    pandas (for example ``pd.compat.os``). Keep the sandbox namespace narrow;
+    snippets still receive DataFrame operations, numeric/date conversion, and
+    the pandas constants used by deterministic code generation.
+    """
+
+    DataFrame = pd.DataFrame
+    Series = pd.Series
+    Index = pd.Index
+    NA = pd.NA
+    NaT = pd.NaT
+    DateOffset = pd.DateOffset
+    Timedelta = pd.Timedelta
+    Timestamp = pd.Timestamp
+    to_numeric = staticmethod(pd.to_numeric)
+    to_datetime = staticmethod(pd.to_datetime)
+    concat = staticmethod(pd.concat)
+    crosstab = staticmethod(pd.crosstab)
+    cut = staticmethod(pd.cut)
+    isna = staticmethod(pd.isna)
+    notna = staticmethod(pd.notna)
+    api = SimpleNamespace(types=SimpleNamespace(is_numeric_dtype=pd.api.types.is_numeric_dtype))
+
+
+SAFE_PANDAS = _PandasFacade()
+
+
 def validate_snippet(code: str) -> str | None:
     """Static analysis pass. Returns an error message, or None if the code is allowed.
 
@@ -126,6 +166,12 @@ def validate_snippet(code: str) -> str | None:
                 return f"Access to dunder attribute '{attr}' is not allowed."
             if attr in DANGEROUS_ATTRS:
                 return f"Attribute '{attr}' is blocked (potential file/network/escape access)."
+            # `pd` is available for legitimate transformations, but pandas
+            # exposes imported modules through namespaces such as
+            # `pd.compat.os` and `pd.io.common.os`. Reject those namespaces
+            # before attribute traversal can reach the host OS.
+            if isinstance(node.value, ast.Name) and node.value.id == "pd" and attr in PANDAS_BLOCKED_NAMESPACES:
+                return f"Pandas namespace '{attr}' is not allowed in the sandbox."
         if isinstance(node, ast.Name):
             if node.id in DANGEROUS_NAMES:
                 return f"Name '{node.id}' is not allowed in the sandbox."
@@ -203,7 +249,7 @@ def _exec_user_code(df: pd.DataFrame, code: str) -> dict:
 
     namespace: dict = {
         "df": df,
-        "pd": pd,
+        "pd": SAFE_PANDAS,
         "__builtins__": SAFE_BUILTINS,
     }
     try:

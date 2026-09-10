@@ -167,7 +167,14 @@ def _check_bar_totals(
         or (spec.filter and "in_top_n" in spec.filter.lower())
     )
     if agg == "count" and not is_topn:
-        source_total = len(source_df)
+        source_for_check = source_df
+        if "filter shipped orders" in notes:
+            status_col = next((c for c in source_df.columns if c.lower() == "status"), None)
+            if status_col:
+                source_for_check = source_df[
+                    source_df[status_col].astype(str).str.contains("shipped", case=False, na=False)
+                ]
+        source_total = len(source_for_check)
         if bars_sum != source_total:
             result.add_warning(
                 f"Bar sum ({bars_sum:.0f}) does not match source row count "

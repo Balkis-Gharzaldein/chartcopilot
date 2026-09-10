@@ -80,7 +80,7 @@ def _pick_xy(spec: ChartSpec, df: pd.DataFrame) -> tuple[str, str]:
     return x, y
 
 
-def _aggregate_if_raw(df: pd.DataFrame, x: str, y: str) -> tuple[pd.DataFrame, bool]:
+def _aggregate_if_raw(df: pd.DataFrame, x: str, y: str, agg: str = "sum") -> tuple[pd.DataFrame, bool]:
     """Collapse repeated categories to one row per category; report if we did."""
     if x not in df.columns or y not in df.columns or y == x:
         return df, False
@@ -89,7 +89,8 @@ def _aggregate_if_raw(df: pd.DataFrame, x: str, y: str) -> tuple[pd.DataFrame, b
         tmp[y] = _to_numeric(tmp[y])
         if tmp[y].notna().sum() == 0:
             return df, False
-        grouped = tmp.dropna(subset=[y]).groupby(x, as_index=False)[y].sum()
+        reducer = agg if agg in ("mean", "median", "min", "max") else "sum"
+        grouped = tmp.dropna(subset=[y]).groupby(x, as_index=False)[y].agg(reducer)
         return grouped, True
     return df, False
 
@@ -144,12 +145,13 @@ def _summary_for_categorical(x, y, df, agg) -> dict:
     dominant = float(top[0]["value"]) if top else 0.0
     return {
         "agg_function": agg,
+        "total_kind": "sum_of_group_statistics" if agg not in ("sum", "count") else "additive_total",
         "measure": y,  # self-describing: what is being totalled
         "grouped_by": x,  # self-describing: what it is grouped across
         "total": round(total, 2),
         "n_categories": int(len(df)),
         "top_categories": top,
-        "top_share": round(dominant / total, 4) if total else 0.0,
+        **({"top_share": round(dominant / total, 4) if total else 0.0} if agg in ("sum", "count") else {}),
     }
 
 
@@ -285,7 +287,7 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
                 raise ChartBuildError(
                     f"Cannot chart '{spec.chart_type}': no value column available (spec y='{spec.y}')."
                 )
-        grouped, regrouped = _aggregate_if_raw(df, x, y)
+        grouped, regrouped = (df, False) if spec.group_by else _aggregate_if_raw(df, x, y, spec.agg_function or "sum")
         if regrouped:
             adaptation.append(f"Aggregated '{y}' by '{x}' ({spec.agg_function or 'sum'}).")
         # pie is meaningless on near-continuous/x data with no natural categories
@@ -296,7 +298,11 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
             adaptation.append("Pie requested on a near-continuous field; substituted a bar chart.")
             return build_chart(spec_copy, df)
 
-        bucketed, note = _bucket_long_tail(grouped, x, y, keep_all=spec.show_tail_categories)
+        additive = (spec.agg_function or "sum") in ("sum", "count") and "derived metric:" not in (spec.data_notes or "").lower()
+        keep_all = spec.show_tail_categories or not additive or bool(spec.group_by) or "other" in grouped[x].astype(str).tolist()
+        bucketed, note = _bucket_long_tail(grouped, x, y, keep_all=keep_all)
+        if not additive and len(grouped) > MAX_CATEGORIES:
+            adaptation.append("All categories retained: non-additive statistics cannot be summed into an 'other' category.")
         if note:
             adaptation.append(note)
         elif spec.show_tail_categories and len(grouped) > MAX_CATEGORIES:
@@ -304,10 +310,17 @@ def build_chart(spec: ChartSpec, df: pd.DataFrame) -> BuiltChart:
                 f"Showing all {len(grouped)} categories under their real names (no 'other' merge)."
             )
         if spec.label_map:
+            mapped = grouped[x].astype(str).map(lambda v: spec.label_map.get(v, v))
+            if not additive and mapped.nunique() < grouped[x].nunique():
+                raise ChartBuildError("Cannot merge labels for non-additive statistics; regroup the source data instead.")
             bucketed = _apply_labels(bucketed, x, y, spec.label_map)
             adaptation.append("Relabeled categories per the edit request.")
 
         if spec.chart_type in ("pie", "donut"):
+            if not additive:
+                raise ChartBuildError("Pie/donut requires additive values (sum or row count), not averages or distinct counts.")
+            if bucketed[y].sum() <= 0:
+                raise ChartBuildError("Pie/donut requires a positive total.")
             if (bucketed[y] < 0).any():
                 raise ChartBuildError("Pie/donut requires non-negative values.")
             hole = 0.45 if spec.chart_type == "donut" else 0
@@ -649,7 +662,7 @@ def _with_time_bucket_col(raw_df: pd.DataFrame, spec: ChartSpec, x: str) -> tupl
     if not m or not x or x not in raw_df.columns:
         return raw_df, x
     bucket = m.group(1)
-    if bucket not in ("monthly", "quarterly", "yearly"):
+    if bucket not in ("monthly", "quarterly", "yearly", "weekly", "daily"):
         return raw_df, x
     try:
         g = raw_df.copy()
@@ -662,8 +675,10 @@ def _with_time_bucket_col(raw_df: pd.DataFrame, spec: ChartSpec, x: str) -> tupl
             g["_time_bucket"] = g[x].dt.to_period("M").astype(str)
         elif bucket == "quarterly":
             g["_time_bucket"] = g[x].dt.to_period("Q").astype(str)
-        else:
+        elif bucket == "yearly":
             g["_time_bucket"] = g[x].dt.year.astype(str)
+        else:
+            g["_time_bucket"] = g[x].dt.to_period("W-SUN" if bucket == "weekly" else "D").astype(str)
         return g, "_time_bucket"
     except Exception:
         return raw_df, x
@@ -690,7 +705,7 @@ def _parse_topn_for_verify(spec: ChartSpec) -> tuple[int, str | None, str | None
     if m2:
         expr = m2.group(2).strip()
         inner = _re.sub(r".*\((.*)\).*", r"\1", expr) if "(" in expr else expr
-        return int(m2.group(1)), spec.x, inner.strip().strip("\"'`")
+        return int(m2.group(1)), spec.group_by or spec.x, inner.strip().strip("\"'`")
     return 0, None, None
 
 
@@ -715,7 +730,17 @@ def _apply_topn_for_verify(g: pd.DataFrame, spec: ChartSpec) -> pd.DataFrame:
         return g
 
 
-def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tuple[bool, dict]:
+def _apply_notes_filters_for_verify(g: pd.DataFrame, spec: ChartSpec) -> pd.DataFrame:
+    """Replicate simple deterministic filters emitted in data_notes."""
+    if "filter shipped orders" not in (spec.data_notes or "").lower():
+        return g
+    status_col = next((c for c in g.columns if c.lower() == "status"), None)
+    if not status_col:
+        return g
+    return g[g[status_col].astype(str).str.contains("shipped", case=False, na=False)]
+
+
+def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict, computed_df: pd.DataFrame | None = None) -> tuple[bool, dict]:
     """Independently recompute the headline numbers from the RAW input frame (a second,
     sandbox-free code path) and compare them with computed_summary.
 
@@ -730,6 +755,14 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
     if raw_df is None or raw_df.empty or len(raw_df) == 0:
         return False, {"error": "No raw frame available to verify against."}
 
+    # Validate every computed group, including the series key. A matching
+    # grand total cannot detect swapped categories or corrupted middle points.
+    if computed_df is not None and spec.chart_type in CHARTS_WITH_CATEGORIES | {"line", "area"}:
+        from tools.verify_result import verify_aggregates
+        full = verify_aggregates(spec, raw_df, computed_df)
+        if full is not None:
+            return full
+
     x = (spec.x or "").strip() or (list(raw_df.columns)[0] if len(raw_df.columns) else "")
     y = (spec.y or "").strip()
     if not y and spec.chart_type in CHARTS_WITH_CATEGORIES:
@@ -743,6 +776,7 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
     needs_split = "split" in notes or "comma" in notes or "explode" in notes
     if spec.chart_type in CHARTS_WITH_CATEGORIES:
         g = raw_df.copy()
+        g = _apply_notes_filters_for_verify(g, spec)
         g = _apply_topn_for_verify(g, spec)
         g = apply_quarantine(g, x)
         derived_margin = "derived metric: profit_margin" in notes
@@ -776,16 +810,24 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
             recomputed = g.groupby(x)[y].nunique().reset_index(name="count")
             recomputed.rename(columns={x: "cat"}, inplace=True)
             value_col = "count"
+        elif agg in ("mean", "average"):
+            if y not in raw_df.columns:
+                return False, {"error": f"Value column '{y}' not found in the raw frame."}
+            g[y] = _clean_numeric_verify(g[y])
+            g = g.dropna(subset=[y])
+            recomputed = g.groupby(x, as_index=False)[y].mean()
+            value_col = y
         else:
             if y not in raw_df.columns:
                 return False, {"error": f"Value column '{y}' not found in the raw frame."}
             g[y] = _clean_numeric_verify(g[y])
             g = g.dropna(subset=[y])
-            recomputed = g.groupby(x, as_index=False)[y].sum()
+            reducer = agg if agg in ("min", "max", "median") else "sum"
+            recomputed = g.groupby(x, as_index=False)[y].agg(reducer)
             value_col = y
         ordered = recomputed.sort_values(value_col, ascending=False).reset_index(drop=True)
         total = float(ordered[value_col].sum())
-        keep_all = bool(getattr(spec, "show_tail_categories", False))
+        keep_all = bool(getattr(spec, "show_tail_categories", False)) or agg not in ("sum", "count") or derived_margin or bool(spec.group_by) or "other" in g[x].astype(str).tolist()
         bucket_count = None if keep_all else MAX_CATEGORIES
         if bucket_count and len(ordered) > bucket_count:
             other_val = float(ordered.iloc[bucket_count:][value_col].sum())
@@ -882,7 +924,8 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
                 return False, {"error": f"Value column '{y}' not found"}
             g[y] = _clean_numeric_verify(g[y])
             g = g.dropna(subset=[y])
-            recomputed = g.groupby(x, as_index=False)[y].sum()
+            reducer = "mean" if agg in ("mean", "average") else "sum"
+            recomputed = g.groupby(x, as_index=False)[y].agg(reducer)
             value_col = y
         total = float(recomputed[value_col].sum())
         checks["total"] = cmp(abs(total - float(summary.get("total", 0))) <= 0.01, total, summary.get("total"))
@@ -898,7 +941,10 @@ def verify_computed(spec: ChartSpec, raw_df: pd.DataFrame, summary: dict) -> tup
             col = y if y in raw_df.columns else x
             if col not in raw_df.columns:
                 return False, {"error": f"Box column '{col}' not found"}
-            n = int(_clean_numeric_verify(raw_df[col]).dropna().shape[0])
+            valid = _clean_numeric_verify(raw_df[col]).notna()
+            if spec.x and spec.x != col and spec.x in raw_df.columns:
+                valid &= raw_df[spec.x].notna()
+            n = int(valid.sum())
             checks["count"] = cmp(abs(n - int(summary.get("count", 0))) <= 1, n, summary.get("count"))
         elif spec.chart_type == "heatmap":
             n_num = len(raw_df.select_dtypes(include=["number"]).columns)

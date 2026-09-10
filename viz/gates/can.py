@@ -87,9 +87,10 @@ def _can_line(spec: ChartSpec, p: DataProfile) -> GateResult:
         # allow categorical if ordered or low cardinality? Strict: need temporal or ordered
         # For CAN we allow categorical but APPROPRIATE will downgrade
         pass
-    if not spec.y or not y:
+    is_count = spec.agg_function == "count" or (spec.agg_function == "count_distinct" and y is not None)
+    if (not spec.y or not y) and not is_count:
         return GateResult(False, "Line requires numeric y", "CAN")
-    if y.role != "numeric":
+    if y and y.role != "numeric" and not is_count:
         return GateResult(False, f"y '{spec.y}' must be numeric for line", "CAN")
     if x.cardinality < 2:
         return GateResult(False, "Line needs ≥2 distinct x values", "CAN")

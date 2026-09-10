@@ -65,17 +65,30 @@ export function AskChartCopilot() {
 
   async function run() {
     const raw=text.trim()
-    if(!raw) return
+    if(!raw || isGenerating) return
     // One request at a time: do not split input into multiple lines/charts
     const effective=[raw]
     setLoading(true); setGenerating?.(true); setError(null)
+    setResults([], [], '')
     try{
       const plan=await api.plan(workbookId!, effective)
+      const clarifications = plan.clarifications || []
+      if (clarifications.length) {
+        const message = clarifications.join(' ')
+        setResults([], plan.specs, message)
+        setError(message)
+        addToast?.(message, 'info')
+        return
+      }
+      if (plan.specs.some((spec: any) => spec.uncertain)) {
+        addToast?.('Some chart choices are uncertain; review the generated chart carefully.', 'info')
+      }
       const exec=await api.execute(workbookId!)
       setResults(exec.results, plan.specs, exec.narrative)
       addToast?.(`Generated ${exec.results.filter((r:any)=> r.figure_json).length} chart(s)`, 'success')
     }catch(e:any){
       const msg=e.message || 'Chart generation failed'
+      setResults([], [], '')
       setError(msg); addToast?.(msg,'error')
     }finally{ setLoading(false); setGenerating?.(false) }
   }
@@ -102,7 +115,7 @@ export function AskChartCopilot() {
             />
             <span className="absolute right-2.5 top-2.5 text-[10px] tracking-wide text-slate-400 hidden sm:block">⌘↵</span>
           </div>
-          <button onClick={run} disabled={loading || !text.trim()} className="shrink-0 h-[44px] px-5 rounded-xl bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 disabled:opacity-40">
+          <button onClick={run} disabled={loading || isGenerating || !text.trim()} className="shrink-0 h-[44px] px-5 rounded-xl bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 disabled:opacity-40">
             {loading ? 'Generating…' : 'Generate'}
           </button>
         </div>

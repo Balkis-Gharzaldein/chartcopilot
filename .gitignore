@@ -38,6 +38,9 @@ Thumbs.db
 # Sample output (generated charts)
 sample_data/vizual mecs radar/
 
+# Internal/raw exports must not be committed as sample data.
+sample_data/*_export_*.csv
+
 # Byte-compiled
 *.pyc
 

@@ -35,7 +35,9 @@ export function DashboardShell() {
         const plan = await api.plan(workbookId, ["Analyze this data"])
         const exec = await api.execute(workbookId)
         if (!cancelled) setResults(exec.results, plan.specs, exec.narrative)
-      } catch {}
+      } catch (error) {
+        if (!cancelled) useStore.getState().addToast(error instanceof Error ? error.message : 'Automatic chart generation failed. Retry from Recommendations.', 'error')
+      }
       finally { if (!cancelled) setGenerating?.(false) }
     }
     run()

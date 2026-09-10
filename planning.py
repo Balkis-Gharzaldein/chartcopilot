@@ -829,7 +829,7 @@ def recommend_charts(spec: ChartSpec, profile: SheetProfile) -> list[ChartSpec]:
     n_categories = _count_categories_for_recommend(spec.x, profile)
 
     # Rule 1: Bar with 2-8 categories → suggest pie
-    if spec.chart_type == "bar" and n_categories and 2 <= n_categories <= 8:
+    if spec.chart_type == "bar" and n_categories and 2 <= n_categories <= 6 and (spec.agg_function or "sum") in ("sum", "count") and "derived metric:" not in (spec.data_notes or "").lower():
         rec = spec.model_copy(deep=True)
         rec.chart_type = "pie"
         rec.title = f"Share of {spec.x}" if spec.x else f"{spec.title} (pie)"
@@ -948,6 +948,96 @@ def _ensure_valid_specs(specs: list[ChartSpec], profiles: list[SheetProfile]) ->
     return out
 
 
+def _clarification_for_spec(spec: ChartSpec, question: str, profile: SheetProfile) -> str | None:
+    """Return a clarification when the selected field is genuinely ambiguous."""
+    if spec.status != "planned" or not question.strip():
+        return None
+    low = question.lower()
+    if any(phrase in low for phrase in ("analyze this data", "explore this", "useful visualizations", "overview")):
+        return None
+
+    numeric = [
+        c.name for c in profile.columns
+        if c.dtype.lower() in {"int64", "int32", "int16", "float64", "float32", "float16", "int", "float"}
+        or looks_numeric_samples(c.sample_values)
+    ]
+    categorical = [
+        c.name for c in profile.columns
+        if c.dtype.lower() in ("object", "string", "category")
+        and not looks_numeric_samples(c.sample_values)
+    ]
+    ranked_numeric = sorted(
+        (( _resolve_score(question, name), name) for name in numeric), reverse=True
+    )
+    ranked_categorical = sorted(
+        (( _resolve_score(question, name), name) for name in categorical), reverse=True
+    )
+    x_score = _resolve_score(question, spec.x) if spec.x else 0.0
+    y_score = _resolve_score(question, spec.y) if spec.y else 0.0
+    evidence = min(x_score, y_score) if spec.y else x_score
+    spec.confidence = 0.95 if evidence >= 6.0 else 0.85 if evidence >= 3.0 else 0.6
+    spec.uncertain = spec.confidence < 0.8
+
+    def close_matches(ranked: list[tuple[float, str]]) -> list[str]:
+        strong = [(score, name) for score, name in ranked if score >= 3.0]
+        if len(strong) >= 2 and strong[0][0] - strong[1][0] < 1.5:
+            return [name for _, name in strong[:3]]
+        return []
+
+    metric_options = close_matches(ranked_numeric)
+    if metric_options and spec.y in metric_options and y_score < 6.0:
+        options = ", ".join(f"`{name}`" for name in metric_options)
+        return f"Which measure should I use for this chart: {options}?"
+
+    dimension_options = close_matches(ranked_categorical)
+    if (
+        spec.chart_type not in {"scatter", "heatmap"}
+        and x_score < 6.0
+        and not any(token in low for token in ("over time", "monthly", "by month", "quarterly", "by quarter", "yearly", "by year"))
+        and dimension_options
+        and spec.x in dimension_options
+    ):
+        options = ", ".join(f"`{name}`" for name in dimension_options)
+        return f"Which grouping column should I use: {options}?"
+
+    has_measure_word = any(
+        word in low for word in ("revenue", "sales", "amount", "value", "quantity", "units", "price", "profit", "average", "mean", "count")
+    )
+    if (
+        spec.y in numeric
+        and len(numeric) > 1
+        and y_score < 6.0
+        and not has_measure_word
+        and "over time" in low
+    ):
+        options = ", ".join(f"`{name}`" for name in numeric[:4])
+        return f"Which numeric measure should I use: {options}?"
+
+    return None
+
+
+def _apply_clarifications(specs: list[ChartSpec], lines: Sequence[str], profiles: list[SheetProfile]) -> list[ChartSpec]:
+    """Mark ambiguous plans as skipped so they cannot silently execute."""
+    # Multiple specs are intentional dual-metric requests; each metric has
+    # already been resolved independently by the planner.
+    if len(lines) != 1 or len(specs) > 1:
+        return specs
+    question = lines[0]
+    by_name = {p.sheet_name: p for p in profiles}
+    for spec in specs:
+        profile = by_name.get(spec.sheet)
+        if not profile:
+            continue
+        clarification = _clarification_for_spec(spec, question, profile)
+        if clarification:
+            spec.confidence = 0.5
+            spec.uncertain = True
+            spec.clarification = clarification
+            spec.status = "skipped"
+            spec.skip_reason = f"Clarification needed: {clarification}"
+    return specs
+
+
 def _is_instructions_sheet(name: str) -> bool:
     n = name.strip().lower().replace("_", " ").replace("-", " ")
     return "instruction" in n or "guideline" in n
@@ -978,13 +1068,13 @@ def plan_charts(profiles: list[SheetProfile], lines: Sequence[str], frames: dict
         specs = orchestrate(profiles, frames, list(lines))
         # If orchestrator returns valid planned specs (single optimal), return them
         if specs and any(s.status == "planned" for s in specs):
-            return _ensure_valid_specs(specs, profiles)
+            return _apply_clarifications(_ensure_valid_specs(specs, profiles), lines, profiles)
         # Orchestrator rejected everything: return the explained skips as-is.
         # No LLM-direct fallback by contract (it invents columns).
         if specs and all(s.status == "skipped" for s in specs):
-            return _ensure_valid_specs(specs, profiles)
+            return _apply_clarifications(_ensure_valid_specs(specs, profiles), lines, profiles)
         if specs:
-            return _ensure_valid_specs(specs, profiles)
+            return _apply_clarifications(_ensure_valid_specs(specs, profiles), lines, profiles)
         # Empty → fallback
     except Exception:
         pass
@@ -1042,4 +1132,4 @@ def plan_charts(profiles: list[SheetProfile], lines: Sequence[str], frames: dict
             planned = [s for s in specs if s.status == "planned"]
             skipped = [s for s in specs if s.status == "skipped"]
             specs = (planned[:2] + skipped) if planned else specs
-    return _ensure_valid_specs(specs, profiles)
+    return _apply_clarifications(_ensure_valid_specs(specs, profiles), lines, profiles)

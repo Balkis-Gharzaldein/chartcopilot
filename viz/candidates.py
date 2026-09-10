@@ -57,6 +57,15 @@ def _best_categorical(profile: DataProfile, intent_raw: str = "", exclude: set[s
     candidates = [c for c in profile.columns if c.name not in exclude and c.role == "categorical"]
     if not candidates:
         return None
+    # Prefer the longest explicit column phrase before broader token scoring;
+    # otherwise "courier status" can collapse to the shorter `Status` column.
+    if intent_raw:
+        from viz.resolve import normalize as _normalize
+
+        raw_norm = _normalize(intent_raw)
+        explicit = [c for c in candidates if _normalize(c.name) in raw_norm]
+        if explicit:
+            return max(explicit, key=lambda c: len(_normalize(c.name))).name
     # Score by intent
     in_cap = [c for c in candidates if 2 <= c.cardinality <= max_card]
     scored = []
@@ -105,6 +114,13 @@ def _best_temporal(profile: DataProfile) -> str | None:
 
 def _pick_agg(intent: AnalyticalIntent, default: str = "sum") -> str:
     if intent.explicit_agg:
+        # A request can mention both revenue and order counts. When one chart
+        # must choose a single numeric metric, revenue should remain an amount
+        # aggregation rather than counting rows in the Amount column.
+        if intent.explicit_agg == "count" and any(
+            term in intent.raw.lower() for term in ("revenue", "sales", "amount", "value")
+        ):
+            return "sum"
         # "How many units/quantity/pcs" means total units, not row count.
         if intent.explicit_agg == "count" and "how many" in intent.raw.lower():
             if any(term in intent.raw.lower() for term in ("unit", "quantity", "qty", "pcs", "volume")):
@@ -303,6 +319,18 @@ def generate_for_intent(intent: AnalyticalIntent, profile: DataProfile, sheet_na
             specs.append(ChartSpec(id=f"spec_{idx_offset+1}_histogram", sheet=sheet_name, chart_type="histogram", title=intent.raw[:90] or f"Distribution of {y}", x=y, y=None, agg_function="count"))
             if x and profile.by_name(x) and profile.by_name(x).cardinality <= 10:
                 specs.append(ChartSpec(id=f"spec_{idx_offset+1}_box", sheet=sheet_name, chart_type="boxplot", title=f"Distribution of {y} by {x}", x=x, y=y, agg_function=None))
+        elif x:
+            notes = "Filter shipped orders" if "shipped" in intent.raw.lower() else None
+            specs.append(ChartSpec(
+                id=f"spec_{idx_offset+1}_bar",
+                sheet=sheet_name,
+                chart_type="bar",
+                title=intent.raw[:90] or f"Distribution of {x}",
+                x=x,
+                y=None,
+                agg_function="count",
+                data_notes=notes,
+            ))
     elif goal == "relationship":
         n1 = _best_numeric(profile, intent.raw, set(), strict=_strict)
         n2 = _best_numeric(profile, intent.raw, {n1} if n1 else set(), strict=_strict)
@@ -366,54 +394,46 @@ def generate_for_intent(intent: AnalyticalIntent, profile: DataProfile, sheet_na
     return specs
 
 def generate_exploratory(profile: DataProfile, sheet_name: str) -> list[ChartSpec]:
-    """First-class exploration: identify valuable analytical questions."""
+    """Generate evidence-based overview candidates, then let ranking curate them.
+
+    Completeness and variation select eligible fields; stable name ordering
+    prevents arbitrary spreadsheet column order from deciding the dashboard.
+    Unknown measurements default to a labelled mean, never an unexplained sum.
+    """
     specs: list[ChartSpec] = []
-    idx = 0
+    eligible = [c for c in profile.columns if not c.is_constant and not c.is_near_constant and c.null_rate <= 0.4]
+    numerics = sorted((c for c in eligible if c.role == "numeric" and not c.variance_zero), key=lambda c: (c.null_rate, c.name))[:6]
+    categories = sorted((c for c in eligible if c.role == "categorical" and 2 <= c.cardinality <= 30), key=lambda c: (c.null_rate, c.cardinality > 10, c.name))[:4]
+    times = sorted((c for c in eligible if c.role == "temporal" and c.cardinality >= 3), key=lambda c: (c.null_rate, c.name))[:1]
 
-    # 1. Best categorical × numeric for comparison
-    x = _best_categorical(profile, "", set(), 100)
-    y = _best_numeric(profile, "", {x} if x else set())
-    if x and y:
-        ctype = "horizontal_bar" if profile.by_name(x).cardinality > 10 else "bar"
-        specs.append(ChartSpec(id=f"exp_{idx+1}_bar", sheet=sheet_name, chart_type=ctype, title=f"{y} by {x}", x=x, y=y, agg_function="sum"))
-        idx += 1
+    def add(ctype, title, x, y=None, agg="count", notes=None):
+        specs.append(ChartSpec(id=f"exp_{len(specs)+1}_{ctype}", sheet=sheet_name, chart_type=ctype,
+                               title=title[:90], x=x, y=y, agg_function=agg, data_notes=notes))
 
-    # 2. Temporal × numeric for trend
-    t = _best_temporal(profile)
-    if t and y:
-        y2 = y or _best_numeric(profile, "", set())
-        if y2:
-            specs.append(ChartSpec(id=f"exp_{idx+1}_line", sheet=sheet_name, chart_type="line", title=f"{y2} over {t}", x=t, y=y2, agg_function="sum"))
-            idx += 1
-
-    # 3. Numeric distribution
-    if y:
-        specs.append(ChartSpec(id=f"exp_{idx+1}_hist", sheet=sheet_name, chart_type="histogram", title=f"Distribution of {y}", x=y, y=None, agg_function="count"))
-        idx += 1
-        if x and profile.by_name(x).cardinality <= 8:
-            specs.append(ChartSpec(id=f"exp_{idx+1}_box", sheet=sheet_name, chart_type="boxplot", title=f"Distribution of {y} by {x}", x=x, y=y))
-            idx += 1
-
-    # 4. Relationship: 2 numerics → scatter
-    n1 = _best_numeric(profile, "", set())
-    n2 = _best_numeric(profile, "", {n1} if n1 else set())
-    if n1 and n2:
-        n3 = _best_numeric(profile, "", {n1, n2})
-        specs.append(ChartSpec(id=f"exp_{idx+1}_scatter", sheet=sheet_name, chart_type="scatter", title=f"{n1} vs {n2}", x=n1, y=n2))
-        idx += 1
-        if len(profile.numeric_cols) >= 3 and n3:
-            specs.append(ChartSpec(id=f"exp_{idx+1}_heatmap", sheet=sheet_name, chart_type="heatmap", title="Correlation of numeric measures", x=n1, y=n2))
-            idx += 1
-
-    # 5. Composition: second categorical for grouped/stacked if exists
-    second_cat = _best_categorical(profile, "", {x} if x else set(), 8)
-    if x and second_cat and y and second_cat != x:
-        specs.append(ChartSpec(id=f"exp_{idx+1}_grouped", sheet=sheet_name, chart_type="grouped_bar", title=f"{y} by {x} and {second_cat}", x=x, y=y, group_by=second_cat, agg_function="sum"))
-        idx += 1
-
-    # 6. Small-cat pie if appropriate (2-5 cats)
-    if x and 2 <= profile.by_name(x).cardinality <= 5 and y:
-        specs.append(ChartSpec(id=f"exp_{idx+1}_pie", sheet=sheet_name, chart_type="pie", title=f"Share of {x}", x=x, y=y, agg_function="sum"))
-        idx += 1
-
+    for c in categories:
+        add("horizontal_bar" if c.cardinality > 8 else "bar", f"Record count by {c.name}", c.name)
+    for n in numerics:
+        tokens = set(re.findall(r"[a-z]+", n.name.lower()))
+        nonadditive = bool(tokens & {"price", "rate", "ratio", "margin", "percent", "percentage", "age", "score", "temperature", "average"}) or "%" in n.name
+        additive = bool(tokens & {"sales", "revenue", "amount", "amt", "quantity", "qty", "units", "pcs", "profit", "cost", "expenses"}) and not nonadditive
+        agg = "sum" if additive else "mean"
+        label = "Total" if additive else "Average"
+        assumption = f"Automatic overview uses {agg}({n.name}); confirm the aggregation for your analysis."
+        add("histogram", f"Distribution of {n.name}", n.name)
+        for c in categories:
+            add("horizontal_bar" if c.cardinality > 8 else "bar", f"{label} {n.name} by {c.name}", c.name, n.name, agg, assumption)
+            if c.cardinality <= 8 and profile.row_count >= c.cardinality * 5:
+                add("boxplot", f"Distribution of {n.name} by {c.name}", c.name, n.name, "mean")
+        for t in times:
+            bucket = ""
+            if t.temporal_coverage_days and t.temporal_coverage_days > 90 and t.cardinality > 30:
+                bucket = " Time bucket: monthly."
+            add("line", f"{label} {n.name} over {t.name}", t.name, n.name, agg, assumption + bucket)
+    names = {c.name for c in numerics}
+    for a, b, corr in profile.top_correlations:
+        if a in names and b in names and abs(corr) >= 0.3:
+            add("scatter", f"{a} vs {b}", a, b, "mean", f"Observed Pearson correlation: {corr:.3f}. Association does not imply causation.")
+    if not numerics:
+        for t in times:
+            add("line", f"Record count over {t.name}", t.name)
     return specs

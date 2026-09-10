@@ -63,13 +63,14 @@ def _app_grouped(spec: ChartSpec, p: DataProfile) -> GateResult:
 def _app_line(spec: ChartSpec, p: DataProfile) -> GateResult:
     x = _get(p, spec.x)
     y = _get(p, spec.y)
-    if not x or not y:
+    is_count = spec.agg_function in ("count", "count_distinct")
+    if not x or (not y and not is_count):
         return GateResult(False, "Missing x/y for line", "APPROPRIATE")
     if x.role not in {"temporal"} and not x.ordered:
         # Categorical unordered with many points is not ideal for line
         if x.cardinality > 15:
             return GateResult(False, f"x '{spec.x}' unordered with {x.cardinality} cats — bar more appropriate than line", "APPROPRIATE")
-    if y.variance_zero:
+    if y and y.variance_zero and not is_count:
         return GateResult(False, "y zero variance, line not appropriate", "APPROPRIATE")
     if x.cardinality < 3:
         return GateResult(False, "Line needs ≥3 distinct x for trend", "APPROPRIATE")

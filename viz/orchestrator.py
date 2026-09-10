@@ -748,7 +748,7 @@ def orchestrate(profiles: list[SheetProfile], frames: dict | None, lines: list[s
     else:
         # Diversity selection on planned only (exploratory / multi)
         # Soft target: aim for 3-6, but allow fewer/more based on quality
-        selected = select_diverse(planned_ranked, k_soft=5)
+        selected = select_diverse(planned_ranked, k_soft=5 if exploratory_intents else max(5, len(lines)), deduplicate_views=bool(exploratory_intents))
 
     # Return specs sorted by score desc, with skipped appended
     result_specs: list[ChartSpec] = [c.spec for c in selected]

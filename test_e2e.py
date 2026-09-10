@@ -8,7 +8,7 @@ from api.main import app
 
 def test_full_pipeline():
     """Test the full pipeline: upload → plan → execute → results with figure_json."""
-    FIXTURE = Path("tests/sample_data/messy_sales_example.xlsx")
+    FIXTURE = Path("sample_data/messy_sales_example.xlsx")
     data = FIXTURE.read_bytes()
 
     # Step 1: Upload workbook
@@ -42,8 +42,9 @@ def test_full_pipeline():
     # Step 4: Execute charts
     exec_resp = client.post(
         f"/api/workbooks/{workbook_id}/execute",
+        json={},
     )
-    assert exec_resp.status_code == 200
+    assert exec_resp.status_code == 200, exec_resp.text
     results = exec_resp.json()["results"]
     figure_results = [r for r in results if r.get("figure_json")]
     print(f"✓ Executed {len(results)} charts, {len(figure_results)} with figure_json")
@@ -64,18 +65,18 @@ def test_full_pipeline():
     refine_resp = client.post(
         f"/api/workbooks/{workbook_id}/refine",
         json={
-            "chartIndex": 0,
-            "refinementRequest": "Change colors to blue and orange",
+            "target_index": 0,
+            "message": "Change colors to blue and orange",
         },
     )
     assert refine_resp.status_code == 200
     refine_data = refine_resp.json()
-    print(f"✓ Refine response: success={refine_data.get('success')}")
-    if refine_data.get("updatedChart"):
-        uc = refine_data["updatedChart"]
+    print(f"✓ Refine response: target_index={refine_data.get('target_index')}")
+    if refine_data.get("results"):
+        uc = refine_data["results"][0]
         print(f"  Updated chart type: {uc['spec']['chart_type']}")
         print(f"  Updated chart title: {uc['spec']['title']}")
-        print(f"  Refinement log: {refine_data.get('refinementLog', 'N/A')}")
+        print(f"  Refinement log: {refine_data.get('reply', 'N/A')}")
 
     print()
     print("=== ALL E2E TESTS PASSED ===")

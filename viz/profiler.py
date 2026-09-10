@@ -113,8 +113,7 @@ class DataProfile:
 
 
 def _is_temporal_name(name: str) -> bool:
-    n = name.lower().strip()
-    return any(tok in n for tok in TEMPORAL_TOKENS)
+    return bool(set(re.findall(r"[a-z]+", name.lower())) & TEMPORAL_TOKENS)
 
 def _is_temporal_samples(samples: list[str]) -> bool:
     import warnings
@@ -202,7 +201,7 @@ def _compute_temporal_coverage(df: pd.DataFrame, col_name: str) -> tuple[str | N
             ser = pd.to_datetime(df[col_name], errors="coerce").dropna()
         if ser.empty:
             return None, None, None, None, None
-        ser = ser.sort_values()
+        ser = ser.drop_duplicates().sort_values()
         min_iso = ser.iloc[0].isoformat()
         max_iso = ser.iloc[-1].isoformat()
         try:
@@ -294,7 +293,13 @@ def profile_data(sheet: SheetProfile, df: pd.DataFrame | None = None) -> DataPro
                 if "datetime" in dtype.lower() or "date" in dtype.lower() or _is_temporal_samples(samples) or _is_temporal_name(name):
                     if _is_temporal_samples(samples) or _is_temporal_name(name):
                         is_temporal = True
-        is_id = _is_identifier(name, ratio, dtype)
+        # A name is a hint, not evidence that arbitrary text is a date.
+        is_temporal = "datetime" in dtype.lower() or _is_temporal_samples(samples)
+        if df is not None and name in df_cols and is_temporal:
+            values = df[name].dropna()
+            parsed = pd.to_datetime(values, errors="coerce", format="mixed")
+            is_temporal = bool(len(values) and parsed.notna().mean() >= 0.9)
+        is_id = _is_identifier(name, ratio, "float64" if is_numeric_samples else dtype)
 
         if is_id and not is_temporal:
             role = "identifier"
@@ -320,6 +325,8 @@ def profile_data(sheet: SheetProfile, df: pd.DataFrame | None = None) -> DataPro
         memory_bytes = memory_kb = memory_mb = None
         top_values = None
 
+        if role == "numeric":
+            is_multi = False  # Thousands separators are not multi-label fields.
         if role == "numeric" and df is not None and name in df_cols:
             try:
                 # Late cleaning for currency strings — preserve raw but ensure numeric for stats
@@ -492,7 +499,7 @@ def profile_data(sheet: SheetProfile, df: pd.DataFrame | None = None) -> DataPro
                 def _clean_num(s):
                     return pd.to_numeric(s.astype(str).str.replace(r'[\$,%]', '', regex=True).str.strip(), errors="coerce")
                 numeric_df = pd.DataFrame({col: _clean_num(df[col]) for col in dp.numeric_cols})
-                corr = numeric_df.corr(numeric_only=True)
+                corr = numeric_df.corr(numeric_only=True, min_periods=5)
                 # Store matrix as dict
                 mat: dict[str, dict[str, float]] = {}
                 for col in corr.columns:
@@ -508,8 +515,9 @@ def profile_data(sheet: SheetProfile, df: pd.DataFrame | None = None) -> DataPro
                     for c2 in corr.columns[i+1:]:
                         v = corr.loc[c1, c2]
                         if pd.notna(v):
-                            pairs.append((str(c1), str(c2), round(float(v), 3)))
-                pairs.sort(key=lambda x: abs(x[2]), reverse=True)
+                            a, b = sorted((str(c1), str(c2)))
+                            pairs.append((a, b, round(float(v), 3)))
+                pairs.sort(key=lambda x: (-abs(x[2]), x[0], x[1]))
                 dp.top_correlations = pairs[:5]
             except Exception:
                 pass

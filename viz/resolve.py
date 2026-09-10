@@ -27,6 +27,14 @@ def normalize(name: str) -> str:
     """Lower, underscores/dashes -> space, amt token -> amount."""
     s = _NORM_RE.sub(" ", (name or "").lower()).strip()
     s = re.sub(r"\bamt\b", "amount", s)
+    # Treat common dataset naming variants as the same analytical concept.
+    s = re.sub(r"\bfulfilment\b|\bfulfilled\b", "fulfillment", s)
+    s = re.sub(r"\bcities\b", "city", s)
+    s = re.sub(r"\bstates\b", "state", s)
+    s = re.sub(r"\bregions\b", "region", s)
+    s = re.sub(r"\bcountries\b", "country", s)
+    s = re.sub(r"\bstyles\b", "style", s)
+    s = re.sub(r"\bcategories\b", "category", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -40,8 +48,8 @@ def tokens(name: str) -> set[str]:
 # Each concept maps to the set of normalized phrases/tokens that imply it.
 CONCEPTS: dict[str, set[str]] = {
     "revenue": {
-        "revenue", "revenues", "sales", "sale", "amount", "gross amount",
-        "order amount", "sales amount", "total sales", "turnover", "receipts",
+        "revenue", "revenues", "sales", "sale", "amount", "value", "gross amount",
+        "order amount", "order value", "sales amount", "total sales", "turnover", "receipts",
         "gross",  # token-level: GROSS AMT matches via amount+gross
     },
     "customer": {
@@ -65,6 +73,14 @@ CONCEPTS: dict[str, set[str]] = {
     "size": {
         "size", "sizes",
     },
+    "location": {
+        "city", "cities", "state", "states", "country", "countries",
+        "region", "regions", "location", "locations", "province", "district",
+    },
+    "fulfillment": {
+        "fulfilment", "fulfillment", "fulfilled", "shipping", "delivery", "dispatch",
+    },
+    "courier": {"courier", "carrier", "tracking", "shipment status"},
 }
 
 

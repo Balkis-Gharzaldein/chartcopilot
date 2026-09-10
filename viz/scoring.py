@@ -136,7 +136,24 @@ def score_candidate(spec: ChartSpec, profile: DataProfile, intent_goal: str, exp
         data_fit -= 15
         reasons.append("high null rate penalized")
 
-    score = data_fit * 0.5 + goal_alignment * 1.5 + card_fit * 1.0 + clarity * 1.0
+    # Normalize weighted components instead of saturating almost every valid
+    # candidate at 100 (which made column order decide the recommendations).
+    quality = 1.0 - max((c.null_rate for c in (x, y, g) if c), default=0.0)
+    signal = 0.0
+    if spec.chart_type == "scatter" and x and y:
+        corr = profile.correlation_matrix.get(x.name, {}).get(y.name)
+        if corr is not None:
+            signal = abs(corr) * 8
+            reasons.append(f"observed Pearson r={corr:.3f}")
+    if spec.chart_type in ("histogram", "boxplot"):
+        measure = y if spec.chart_type == "boxplot" else x
+        if measure and measure.outlier_pct:
+            signal = min(8, measure.outlier_pct)
+            reasons.append(f"{measure.outlier_pct:.1f}% IQR/z-score outliers")
+    breakdown["data_fit"] = data_fit
+    breakdown["completeness"] = quality
+    breakdown["observed_signal"] = signal
+    score = data_fit * 0.45 + goal_alignment * 0.8 + card_fit * 0.8 + clarity * 0.5 + quality * 10 + signal
     # Normalize to 0-100
     score = max(0, min(100, score))
 

@@ -22,6 +22,7 @@ from guideline import extract_guideline
 from ingestion import ingest_file
 from narrative import synthesize_narrative
 from planning import plan_charts
+from schemas import ChartResult
 
 def _to_fig(figure_json: str):
     try:
@@ -108,6 +109,12 @@ def run_pipeline():
     with st.spinner("Planning chart specs…"):
         specs = plan_charts(workbook.profiles, line_data.lines, frames=workbook.frames)
     st.session_state.pending_specs = specs
+    clarifications = [s.clarification for s in specs if s.clarification]
+    if clarifications:
+        st.session_state.results = [ChartResult(spec=s) for s in specs]
+        st.session_state.narrative = " ".join(clarifications)
+        st.session_state.run_done = True
+        return
     progress_box = st.empty()
     progress_box.caption("Preparing the sandbox…")
 
@@ -148,6 +155,7 @@ with st.expander("View chart plan (including skipped items)"):
                 f"(x={s.x}, y={s.y})"
                 + (f", group_by={s.group_by}" if s.group_by else "")
                 + (f", agg={s.agg_function}" if s.agg_function else "")
+                + (f", confidence={s.confidence:.0%}" if s.uncertain else "")
             )
 
 # --- narrative -----------------------------------------------------------------------

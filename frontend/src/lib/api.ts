@@ -30,7 +30,7 @@ export const api = {
   }),
   plan: (id: string, lines: string[]) => jfetch(`/api/workbooks/${id}/plan`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines }),
-  }) as Promise<{ specs: any[]; llm_available: boolean }>,
+  }) as Promise<{ specs: any[]; llm_available: boolean; clarifications: string[] }>,
   execute: (id: string, spec_ids?: string[]) => jfetch(`/api/workbooks/${id}/execute`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(spec_ids ? { spec_ids } : {}),
   }) as Promise<{ results: any[]; narrative: string; llm_available: boolean }>,

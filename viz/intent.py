@@ -713,8 +713,12 @@ def _deterministic_vizspecs(lines: list[str], sheet_profiles: list[SheetProfile]
                         is_categorical = dtype in ("object", "string", "category") or "object" in dtype
                         if not (is_temporal or is_categorical):
                             continue
-                        cnorm = _norm(col)
-                        if any(tok in low for tok in cnorm.split()):
+                        # Resolve the full question instead of matching any
+                        # column token. Matching the stopword "by" previously
+                        # selected `fulfilled-by` for a request about cities.
+                        from viz.resolve import score_query
+
+                        if score_query(raw, col) >= 3.0:
                             if col not in dims:
                                 dims.append(col)
                 # If no dims but has_time, try to find Style-like categorical

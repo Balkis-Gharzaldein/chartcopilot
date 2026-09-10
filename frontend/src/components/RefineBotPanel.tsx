@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { api } from '../lib/api'
 import { useStore } from '../lib/store'
 
 type Props = {
@@ -9,7 +10,7 @@ type Props = {
 
 type ChatMsg = { type: 'user' | 'bot'; message: string; isError?: boolean }
 
-export function RefineBotPanel({ chart, chartIndex, onRefine }: Props) {
+export function RefineBotPanel({ chartIndex, onRefine }: Props) {
   const { workbookId } = useStore()
   const [history, setHistory] = useState<ChatMsg[]>([])
   const [userMessage, setUserMessage] = useState('')
@@ -17,27 +18,18 @@ export function RefineBotPanel({ chart, chartIndex, onRefine }: Props) {
 
   const handleSend = async () => {
     if (!userMessage.trim()) return
+    if (!workbookId) {
+      setHistory(prev => [...prev, { type: 'bot', message: 'No workbook is loaded.', isError: true }])
+      return
+    }
     const msg = userMessage
     setHistory(prev => [...prev, { type: 'user', message: msg }])
     setLoading(true)
     try {
-      const res = await fetch('/api/charts/refine', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          workbookId,
-          chartIndex,
-          refinementRequest: msg,
-          currentChartSpec: chart.spec,
-        }),
-      })
-      const data = await res.json()
-      if (data.success && data.updatedChart) {
-        setHistory(prev => [...prev, { type: 'bot', message: data.refinementLog || 'Chart updated' }])
-        onRefine(data.updatedChart, data.refinementLog)
-      } else {
-        setHistory(prev => [...prev, { type: 'bot', message: `Error: ${data.error}`, isError: true }])
-      }
+      const data = await api.refine(workbookId, msg, chartIndex)
+      const updatedChart = data.results[chartIndex]
+      setHistory(prev => [...prev, { type: 'bot', message: data.reply || 'Chart updated' }])
+      onRefine(updatedChart, data.reply)
     } catch (err: any) {
       setHistory(prev => [...prev, { type: 'bot', message: `Error: ${err.message}`, isError: true }])
     } finally {

@@ -61,6 +61,18 @@ class TestSandboxBlocksMaliciousCode(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertTrue(res.blocked)
 
+    def test_indirect_pandas_os_paths_blocked(self):
+        # pandas exposes imported modules through compatibility and IO
+        # namespaces; these must not become an escape hatch for shell/file I/O.
+        for code in (
+            "result = pd.compat.os.system('echo escaped')",
+            "result = pd.io.common.os.system('echo escaped')",
+            "result = pd.compat.subprocess.Popen(['echo', 'escaped'])",
+        ):
+            res = run_snippet(make_df(), code)
+            self.assertFalse(res.ok, code)
+            self.assertTrue(res.blocked, code)
+
     def test_dunder_attribute_blocked(self):
         for code in (
             "result = ().__class__.__bases__[0].__subclasses__()",

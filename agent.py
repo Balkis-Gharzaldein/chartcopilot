@@ -64,6 +64,7 @@ def _translate_filter(desc: str, df: pd.DataFrame):
     if not m:
         return None
     col_name, op, val = m.groups()
+    op = "==" if op == "=" else op
     for c in df.columns:
         if c.lower() == col_name.strip().lower():
             col_name = c
@@ -72,8 +73,8 @@ def _translate_filter(desc: str, df: pd.DataFrame):
         return None
     if col_name not in df.columns:
         return None
-    if val.strip().replace(".", "", 1).isdigit():
-        val_out = float(val.strip()) if "." in val else int(val.strip())
+    if re.fullmatch(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", val.strip()):
+        val_out = float(val.strip())
     elif val.strip().startswith('"') or val.strip().startswith("'"):
         val_out = val.strip().strip('"').strip("'")
     else:
@@ -112,13 +113,13 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
     if spec.chart_type not in GROUP_AWARE and spec.group_by:
         spec.group_by = None
 
-    if not y and cols:
+    if not y and cols and agg not in ("count", "count_distinct"):
         numeric = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
         y = numeric[0] if numeric else None
 
     chunks: list[str] = []
     # Late cleaning for currency strings ($ , %): ensure y is numeric before any agg (Top 10 concatenated bug)
-    if y and y in cols:
+    if y and y in cols and agg not in ("count", "count_distinct") and not any(t in notes for t in ("nunique", "count distinct")):
         # Use deep cleaning like histogram branch, preserve raw for display but ensure numeric for sum
         chunks.append(f"df[{_fg(y)}] = pd.to_numeric(df[{_fg(y)}].astype(str).str.replace(r'[\\$,%]', '', regex=True).str.strip(), errors='coerce')")
     if derived_margin and margin_sales and margin_cost:
@@ -163,7 +164,7 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
             bucket = m_tb.group(1)
             # Try to parse temporal column to datetime then bucket
             if bucket == "monthly":
-                chunks.append(f"df[{_fg(x)}] = pd.to_datetime(df[{_fg(x)}], errors='coerce')")
+                chunks.append(f"df[{_fg(x)}] = pd.to_datetime(df[{_fg(x)}], errors='coerce', format='mixed')")
                 chunks.append(f"df = df.dropna(subset=[{_fg(x)}])")
                 chunks.append(f"df['_time_bucket'] = df[{_fg(x)}].dt.to_period('M').astype(str)")
                 # Keep the planned source column on the spec. The derived
@@ -171,14 +172,20 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
                 # into stored specs used by later executions/refinements.
                 x = "_time_bucket"
             elif bucket == "quarterly":
-                chunks.append(f"df[{_fg(x)}] = pd.to_datetime(df[{_fg(x)}], errors='coerce')")
+                chunks.append(f"df[{_fg(x)}] = pd.to_datetime(df[{_fg(x)}], errors='coerce', format='mixed')")
                 chunks.append(f"df = df.dropna(subset=[{_fg(x)}])")
                 chunks.append(f"df['_time_bucket'] = df[{_fg(x)}].dt.to_period('Q').astype(str)")
                 x = "_time_bucket"
             elif bucket == "yearly":
-                chunks.append(f"df[{_fg(x)}] = pd.to_datetime(df[{_fg(x)}], errors='coerce')")
+                chunks.append(f"df[{_fg(x)}] = pd.to_datetime(df[{_fg(x)}], errors='coerce', format='mixed')")
                 chunks.append(f"df = df.dropna(subset=[{_fg(x)}])")
                 chunks.append(f"df['_time_bucket'] = df[{_fg(x)}].dt.year.astype(str)")
+                x = "_time_bucket"
+            elif bucket in ("weekly", "daily"):
+                frequency = "W-SUN" if bucket == "weekly" else "D"
+                chunks.append(f"df[{_fg(x)}] = pd.to_datetime(df[{_fg(x)}], errors='coerce', format='mixed')")
+                chunks.append(f"df = df.dropna(subset=[{_fg(x)}])")
+                chunks.append(f"df['_time_bucket'] = df[{_fg(x)}].dt.to_period({frequency!r}).astype(str)")
                 x = "_time_bucket"
 
     # Filter pushdown: handle structured filters from VizSpec (in_top_n, last_n, in, between)
@@ -264,6 +271,12 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
         cond = _translate_filter(spec.filter, df)
         if cond:
             chunks.append(f"df = df[{cond[0]} {cond[1]}]")
+    if "filter shipped orders" in notes:
+        status_col = next((c for c in cols if c.lower() == "status"), None)
+        if status_col:
+            chunks.append(
+                f"df = df[df[{_fg(status_col)}].astype(str).str.contains('shipped', case=False, na=False)]"
+            )
 
     # --- data_notes: split / explode ---
     if "split" in notes or "comma" in notes or "explode" in notes:
@@ -284,11 +297,16 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
 
     if spec.chart_type == "scatter":
         xs, ys = x or cols[0], y or (cols[1] if len(cols) > 1 else cols[0])
+        chunks.append(f"df[{_fg(xs)}] = pd.to_numeric(df[{_fg(xs)}].astype(str).str.replace(r'[\\$,%]', '', regex=True).str.strip(), errors='coerce')")
         chunks.append(f"result = df[[{_fg(xs)}, {_fg(ys)}]].dropna()")
         return "\n".join(chunks)
 
     if spec.chart_type in ("line", "area"):
         xcol = x or cols[0]
+        if agg == "count":
+            keys = [xcol] + ([spec.group_by] if spec.group_by and spec.group_by in cols else [])
+            chunks.append(f"result = df.groupby({keys!r}).size().reset_index(name='count')")
+            return "\n".join(chunks)
         if derived_margin:
             chunks.append(f"_m = df.groupby({_fg(xcol)}, as_index=False)[[{_fg(margin_sales)}, {_fg(margin_cost)}]].sum()")
             chunks.append(f"_m[{_fg(y)}] = ((_m[{_fg(margin_sales)}] - _m[{_fg(margin_cost)}]) / _m[{_fg(margin_sales)}].replace(0, pd.NA) * 100).fillna(0)")
@@ -320,7 +338,7 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
     if spec.chart_type == "histogram":
         col = x or y or cols[0]
         # Handle string numeric like GROSS AMT with $, commas
-        chunks.append(f"df[{_fg(col)}] = pd.to_numeric(df[{_fg(col)}].astype(str).str.replace(r'[\\$,]', '', regex=True).str.replace(',', ''), errors='coerce')")
+        chunks.append(f"df[{_fg(col)}] = pd.to_numeric(df[{_fg(col)}].astype(str).str.replace(r'[\\$,%]', '', regex=True).str.strip(), errors='coerce')")
         chunks.append(f"df = df.dropna(subset=[{_fg(col)}])")
         chunks.append(f"result = df[[{_fg(col)}]].dropna()")
         return "\n".join(chunks)
@@ -379,7 +397,7 @@ def _codegen_deterministic(spec: ChartSpec, df: pd.DataFrame) -> str:
     # --- data_notes: top N ---
     import re as _re
     m = _re.search(r"top\s+(\d+)", notes)
-    if m:
+    if m and not (spec.group_by and re.search(r"top\s+\d+\s+by\b", notes)):
         n = int(m.group(1))
         chunks.append(f"result = result.sort_values(result.columns[-1], ascending=False).head({n})")
 
@@ -593,6 +611,25 @@ def resolve_edit(message: str, results: Sequence[ChartResult]) -> tuple[ChartRes
     return results[best_idx], "matched"
 
 
+def _friendly_execution_error(error: str | None, *, blocked: bool = False, timed_out: bool = False) -> tuple[str, str]:
+    """Convert internal sandbox failures into safe, actionable user feedback."""
+    if blocked:
+        return "security_block", "The chart calculation was blocked by the sandbox for safety."
+    if timed_out:
+        return "timeout", "The chart calculation took too long and was stopped. Try a simpler request."
+    text = (error or "").strip()
+    lower = text.lower()
+    if "keyerror" in lower or "not found in the raw frame" in lower:
+        return "missing_column", "The chart calculation referenced a column that is not available in the dataset."
+    if "syntaxerror" in lower or "does not parse" in lower:
+        return "invalid_code", "The chart calculation could not be parsed. Please rephrase the request."
+    if "typeerror" in lower or "valueerror" in lower or "cannot convert" in lower:
+        return "invalid_calculation", "The requested calculation could not be applied to the selected data."
+    if "empty result" in lower:
+        return "empty_result", "The calculation returned no data. Try a broader request or check the filters."
+    return "execution_error", "The chart calculation failed. Try rephrasing the request or choosing another measure."
+
+
 def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) -> ChartResult:
     if spec.status == "skipped":
         return ChartResult(spec=spec)
@@ -619,6 +656,10 @@ def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) 
         _blanks = 0
 
     last_error: str | None = None
+    last_verification: dict = {}
+    last_category = "execution_error"
+    last_blocked = False
+    last_timed_out = False
     feedback: str | None = None
     # Snapshot the planned x: deterministic codegen may rewrite spec.x to a
     # derived `_time_bucket` column for chart building. Verification must run
@@ -641,6 +682,11 @@ def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) 
         run_result = run_code.run_snippet(df, code)  # tool call #2
         if not run_result.ok:
             last_error = run_result.error
+            last_blocked = run_result.blocked
+            last_timed_out = run_result.timed_out
+            last_category, _ = _friendly_execution_error(
+                run_result.error, blocked=run_result.blocked, timed_out=run_result.timed_out
+            )
             feedback = (
                 "Security block: the code is not allowed. Rewrite it with a safe, "
                 "pure-pandas approach."
@@ -654,6 +700,7 @@ def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) 
         built_df = run_code.reconstruct_df(run_result)
         if built_df is None or built_df.empty or len(built_df) == 0:
             last_error = "The snippet produced an empty result."
+            last_category, _ = _friendly_execution_error(last_error)
             feedback = f"Empty result (attempt {attempt + 1}). Produce an aggregated DataFrame."
             continue
 
@@ -669,6 +716,7 @@ def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) 
             chart = create_chart.build_chart(render_spec, built_df)  # tool call #3
         except ChartBuildError as exc:
             last_error = str(exc)
+            last_category = "chart_build_error"
             feedback = f"Chart build failed (attempt {attempt + 1}): {exc}"
             continue
 
@@ -679,7 +727,13 @@ def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) 
         if spec.x != _verify_x:
             _verify_spec = spec.model_copy()
             _verify_spec.x = _verify_x
-        verified, verification = create_chart.verify_computed(_verify_spec, df, chart.computed_summary)
+        verified, verification = create_chart.verify_computed(_verify_spec, df, chart.computed_summary, computed_df=built_df)
+        if not verified and verification.get("scope") == "all_groups":
+            last_verification = verification
+            last_error = "Computed chart values did not match independent source-data verification."
+            last_category = "verification_failed"
+            feedback = last_error + " " + str(verification)
+            continue
 
         # --- semantic validation: verify result logic ---
         validation_result = validate_chart(render_spec, df, built_df, chart.computed_summary)
@@ -715,10 +769,19 @@ def execute_spec(spec: ChartSpec, workbook: Workbook, attempt_llm: bool = True) 
             validation=validation_result.to_dict(),
         )
 
-    note = last_error or "Unknown execution error."
+    category, note = _friendly_execution_error(
+        last_error, blocked=last_blocked, timed_out=last_timed_out
+    )
+    if last_category in ("chart_build_error", "verification_failed"):
+        category = last_category
+    if last_category == "verification_failed":
+        note = "The calculated chart did not match the source data and was withheld. Please refine the request."
     return ChartResult(
         spec=spec,
-        adaptation_note=f"Could not build this chart: {note}",
+        adaptation_note=note,
+        execution_error=last_error,
+        execution_error_category=category or last_category,
+        verification=last_verification,
     )
 
 

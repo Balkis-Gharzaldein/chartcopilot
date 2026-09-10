@@ -17,7 +17,9 @@ NARRATIVE_SYSTEM_PROMPT = (
     "You write a short plain-language summary of data visualizations (150-300 words). "
     "Every claim you make must be directly supported by a number in the provided "
     "summaries. Do not introduce any figure, trend, or comparison that isn't present "
-    "in the input data. Cite each figure inline in parentheses next to the claim it "
+    "in the input data. A total_kind of sum_of_group_statistics is not a dataset "
+    "total; never describe it as a total or use it for shares. Cite individual "
+    "group statistics instead. Cite each figure inline next to the claim it "
     "supports, naming the measure, e.g. (total sales: 790,506) or (top: Widget Pulse, "
     "32,187)."
 )
@@ -38,6 +40,12 @@ def _fallback_sentence(desc, r: ChartResult) -> str:
         return f"No figures were computed for '{title}'."
     top = (s.get("top_categories") or [{}])[0]
     if "total" in s and top:
+        if s.get("total_kind") == "sum_of_group_statistics" or (r.spec.agg_function or "sum") not in ("sum", "count") or "derived metric:" in (r.spec.data_notes or "").lower():
+            return (
+                f"The highest group statistic in '{title}' is '{top.get('category')}' "
+                f"at {top.get('value'):g}{cite} ({r.spec.agg_function or 'sum'}), "
+                f"across {s.get('n_categories', 0)} groups shown."
+            )
         share = s.get("top_share")
         share_txt = f" ({share:.0%} of the total)" if share else ""
         return (

@@ -15,9 +15,9 @@ from pydantic import BaseModel
 
 M = TypeVar("M", bound=BaseModel)
 
-DEFAULT_MODEL_ANTHROPIC = os.environ.get("CHARTCOPILOT_MODEL", "claude-3-5-sonnet-20241022")
-DEFAULT_MODEL_OPENAI = os.environ.get("CHARTCOPILOT_MODEL", "gpt-4o-mini")
-DEFAULT_MODEL_GEMINI = os.environ.get("CHARTCOPILOT_MODEL", "gemini-2.5-flash")
+DEFAULT_MODEL_ANTHROPIC = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
+DEFAULT_MODEL_OPENAI = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+DEFAULT_MODEL_GEMINI = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 STRUCT_TOOL_NAME = "structured_response"
 

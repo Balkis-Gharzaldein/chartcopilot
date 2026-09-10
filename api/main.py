@@ -20,6 +20,7 @@ Run:  uvicorn api.main:app --reload --port 8000   (from chartcopilot/ dir)
 from __future__ import annotations
 
 import uuid
+from collections import OrderedDict
 from typing import Any
 
 from dotenv import load_dotenv
@@ -37,7 +38,6 @@ from llm import available_provider
 from narrative import synthesize_narrative
 from planning import plan_charts
 from schemas import ChartResult, ChartSpec, SheetProfile
-from viz.refiner import refine_chart as viz_refine_chart
 
 app = FastAPI(
     title="ChartCopilot API",
@@ -47,8 +47,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["http://localhost:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -66,13 +65,16 @@ class WorkbookStore:
         self.narrative: str = ""
 
 
-STORE: dict[str, WorkbookStore] = {}
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+MAX_WORKBOOKS = 20
+STORE: OrderedDict[str, WorkbookStore] = OrderedDict()
 
 
 def _get_store(workbook_id: str) -> WorkbookStore:
     entry = STORE.get(workbook_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"workbook_id '{workbook_id}' not found. Upload a file first.")
+    STORE.move_to_end(workbook_id)
     return entry
 
 
@@ -94,12 +96,12 @@ class GuidelineResponse(BaseModel):
 
 class PlanRequest(BaseModel):
     lines: list[str] = Field(description="Guideline lines — one chart intent per line")
-    use_llm: bool | None = Field(default=None, description="Override LLM usage; defaults to key presence")
 
 
 class PlanResponse(BaseModel):
     specs: list[ChartSpec]
     llm_available: bool = False
+    clarifications: list[str] = Field(default_factory=list)
 
 
 class ExecuteRequest(BaseModel):
@@ -157,7 +159,11 @@ def health():
 async def create_workbook(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided.")
-    data = await file.read()
+    if file.size is not None and file.size > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File is too large. Maximum upload size is 200 MB.")
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File is too large. Maximum upload size is 200 MB.")
     if len(data) == 0:
         raise HTTPException(status_code=400, detail="Empty file.")
     try:
@@ -167,6 +173,9 @@ async def create_workbook(file: UploadFile = File(...)):
 
     workbook_id = uuid.uuid4().hex[:12]
     STORE[workbook_id] = WorkbookStore(workbook, file.filename)
+    STORE.move_to_end(workbook_id)
+    while len(STORE) > MAX_WORKBOOKS:
+        STORE.popitem(last=False)
     return WorkbookResponse(
         workbook_id=workbook_id,
         filename=file.filename,
@@ -233,7 +242,8 @@ def plan(workbook_id: str, body: PlanRequest):
     entry.specs = specs
     entry.results = []
     entry.narrative = ""
-    return PlanResponse(specs=specs, llm_available=_has_llm())
+    clarifications = [s.clarification for s in specs if s.clarification]
+    return PlanResponse(specs=specs, llm_available=_has_llm(), clarifications=clarifications)
 
 
 @app.post("/api/workbooks/{workbook_id}/execute", response_model=ExecuteResponse)
@@ -331,19 +341,6 @@ class ChartsGenerateResponse(BaseModel):
     charts: list[ChartResult] = Field(default_factory=list)
     error: str | None = None
 
-class ChartsRefineRequest(BaseModel):
-    workbookId: str
-    chartIndex: int = Field(description="Index of chart in results")
-    refinementRequest: str = Field(description="Natural language refinement, e.g. 'change colors to blue and orange'")
-    currentChartSpec: ChartSpec | None = Field(default=None, description="Current chart spec being refined")
-
-class ChartsRefineResponse(BaseModel):
-    success: bool
-    updatedChart: ChartResult | None = None
-    refinementLog: str | None = None
-    error: str | None = None
-
-
 @app.post("/api/charts/generate", response_model=ChartsGenerateResponse, summary="Generate charts from natural language question")
 def charts_generate(body: ChartsGenerateRequest):
     store = STORE.get(body.workbookId)
@@ -368,33 +365,6 @@ def charts_generate(body: ChartsGenerateRequest):
         return ChartsGenerateResponse(success=True, charts=results)
     except Exception as exc:  # noqa: BLE001
         return ChartsGenerateResponse(success=False, charts=[], error=str(exc))
-
-
-@app.post("/api/charts/refine", response_model=ChartsRefineResponse, summary="Refine an existing chart via natural language")
-def charts_refine(body: ChartsRefineRequest):
-    store = STORE.get(body.workbookId)
-    if not store:
-        return ChartsRefineResponse(success=False, error=f"workbookId '{body.workbookId}' not found")
-    if not store.results:
-        return ChartsRefineResponse(success=False, error="No charts to refine. Generate charts first.")
-    if not (0 <= body.chartIndex < len(store.results)):
-        return ChartsRefineResponse(success=False, error="chartIndex out of range")
-    if not body.refinementRequest or not body.refinementRequest.strip():
-        return ChartsRefineResponse(success=False, error="refinementRequest is required")
-    try:
-        # The server-side result is authoritative. Do not allow a browser to
-        # replace columns, sheet names, or chart metadata during refinement.
-        current_spec = store.results[body.chartIndex].spec
-        updated, log = viz_refine_chart(store.workbook, body.chartIndex, store.results, body.refinementRequest.strip(), current_spec)
-        # Update store
-        new_results = list(store.results)
-        new_results[body.chartIndex] = updated
-        store.results = new_results
-        store.specs[body.chartIndex] = updated.spec
-        store.narrative = synthesize_narrative(store.results)
-        return ChartsRefineResponse(success=True, updatedChart=updated, refinementLog=log)
-    except Exception as exc:  # noqa: BLE001
-        return ChartsRefineResponse(success=False, error=str(exc))
 
 
 @app.delete("/api/workbooks/{workbook_id}")

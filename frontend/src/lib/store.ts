@@ -102,7 +102,7 @@ export const useStore = create<Store>((set) => ({
   isGenerating: false,
   dataProfiles: null,
   toasts: [],
-  setWorkbook: (workbookId, filename, profiles, llmAvailable) => set({ workbookId, filename, profiles, llmAvailable, dataProfiles: null }),
+  setWorkbook: (workbookId, filename, profiles, llmAvailable) => set({ workbookId, filename, profiles, llmAvailable, dataProfiles: null, results: [], specs: [], narrative: '', activeChartId: null }),
   setResults: (results, specs, narrative) => set({ results, specs, narrative }),
   setActiveChart: (activeChartId) => set({ activeChartId }),
   setDrawerTab: (drawerTab) => set({ drawerTab }),

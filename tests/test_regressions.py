@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from agent import execute_plan
+from agent import execute_plan, execute_spec
 from ingestion import Workbook, profile_sheet
 from planning import _ensure_valid_specs, plan_charts
 from schemas import ChartSpec
@@ -73,6 +73,23 @@ def test_invalid_group_by_is_explained_as_skipped():
     result = _ensure_valid_specs([spec], _workbook().profiles)
     assert result[0].status == "skipped"
     assert "group_by" in (result[0].skip_reason or "")
+
+
+def test_execution_failure_is_user_safe_and_categorized():
+    spec = ChartSpec(
+        id="bad_execution",
+        sheet="data",
+        chart_type="bar",
+        title="Missing column",
+        x="missing_dimension",
+        y="sales",
+        agg_function="sum",
+    )
+    result = execute_spec(spec, _workbook(), attempt_llm=False)
+    assert result.figure_json is None
+    assert result.execution_error_category == "missing_column"
+    assert result.adaptation_note == "The chart calculation referenced a column that is not available in the dataset."
+    assert "KeyError" in (result.execution_error or "")
 
 
 def test_profit_margin_is_derived_from_sales_and_cost():

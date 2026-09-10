@@ -30,9 +30,8 @@ An **agentic Excel-visualization agent** that turns a spreadsheet plus plain-Eng
 │  • Determine chart type (bar/line/pie/scatter/horiz_bar)    │
 │  → list[ChartSpec]  (pydantic-validated)                    │
 │                                                              │
-│  Modes:                                                      │
-│  • LLM mode (with API key) → structured output via LLM      │
-│  • Deterministic mode (no API key) → heuristic planner      │
+│  Mode:                                                       │
+│  • Deterministic planner → heuristic, validated chart specs │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
@@ -65,7 +64,7 @@ An **agentic Excel-visualization agent** that turns a spreadsheet plus plain-Eng
 │  NARRATIVE SYNTHESIS                                        │
 │  • Input: computed_summary dicts only (never raw data)      │
 │  • Every claim must trace to a number                       │
-│  • LLM mode or deterministic template fallback              │
+│  • LLM-assisted or deterministic template fallback          │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
@@ -96,7 +95,7 @@ An **agentic Excel-visualization agent** that turns a spreadsheet plus plain-Eng
 ## Requirements
 
 - Python 3.9+
-- Optional: `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` or `GEMINI_API_KEY` for LLM mode
+- Optional: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY` for LLM-assisted codegen and narrative
 
 Without an API key the app works end-to-end in **deterministic mode** — clearly flagged in the UI.
 
@@ -117,10 +116,9 @@ source .venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
-# (Optional) Enable LLM mode
-# export ANTHROPIC_API_KEY=sk-...
-# export OPENAI_API_KEY=sk-...
+# (Optional) Enable LLM-assisted codegen and narrative
 # export GEMINI_API_KEY=sk-...
+# export GEMINI_MODEL=gemini-2.5-flash
 
 # Run the app
 streamlit run app.py
@@ -135,6 +133,8 @@ docker build -t chartcopilot .
 docker run -p 8501:8501 chartcopilot
 ```
 
+The Docker image starts the legacy Streamlit interface only. The React frontend and FastAPI backend are run separately during development.
+
 ## Tests
 
 ```bash
@@ -147,12 +147,15 @@ python -m pytest tests/ -v
 chartcopilot/
 ├── app.py                  # Streamlit entrypoint (upload, run, dashboard, chat)
 ├── agent.py                # ReAct tool loop + codegen (LLM & deterministic)
-├── planning.py             # Guideline → ChartSpec + recommendations (LLM & deterministic)
+├── planning.py             # Deterministic guideline → ChartSpec planning
 ├── schemas.py              # Pydantic v2 models
 ├── ingestion.py            # Excel/CSV parsing, header detection, profiling
 ├── guideline.py            # Instructions sheet / text area extraction
 ├── narrative.py            # Grounded summary from computed aggregates
 ├── llm.py                  # Anthropic/OpenAI/Gemini client abstraction
+├── api/                    # FastAPI backend for the React frontend
+├── viz/                    # Data profiling, orchestration, and chart intelligence
+├── frontend/               # React/Vite dashboard
 ├── tools/
 │   ├── inspect_data.py     # Schema inspection (never raw data)
 │   ├── run_code.py         # Sandboxed pandas execution
@@ -182,11 +185,13 @@ The planning stage groups guideline lines by intent and generates `ChartSpec` ob
 4. **Aggregation detection** — "count", "sum", "average", "count distinct" are detected
 5. **Data notes** — split/comma, top-N, sort order are extracted for the codegen stage
 
+Planning is deterministic. It resolves columns, chart shape, and validation rules without calling an LLM. An LLM may assist later code generation and narrative synthesis when an API key is configured.
+
 ### Codegen Stage
 
 Two modes for generating pandas snippets:
 
-- **LLM mode**: sends the ChartSpec + schema to an LLM, which returns a pandas snippet
+- **LLM-assisted mode**: sends the ChartSpec + schema to an LLM, which returns a pandas snippet
 - **Deterministic mode**: rule-based codegen that handles:
   - Split/explode for comma-separated values
   - `nunique()` for count-distinct
@@ -197,6 +202,26 @@ Two modes for generating pandas snippets:
 ### Verification
 
 After each chart is built, `verify_computed` independently recomputes the headline numbers from the raw data and compares them with the chart's `computed_summary`. This catches mismatches between what the codegen produced and what the data actually says.
+
+For supported categorical and time-series aggregations, execution additionally verifies **every computed group and series value** against an independent host-side calculation (`tools/verify_result.py`). This covers sums, means, minima, maxima, medians, row counts, distinct counts, time buckets, split labels, simple comparison filters, and supported top-N selections. A full-table mismatch withholds the chart and returns `verification_failed`; matching grand totals alone cannot certify these results. Timestamp serialization is normalized before comparison.
+
+Verification scope is available in the result: `scope: all_groups` means the complete computed aggregate table was checked. Derived metrics and unsupported transformations still use the existing summary checks; histogram, box, and heatmap checks remain limited to shape/count checks. Verification establishes agreement with the selected calculation, not that an ambiguous business question was interpreted correctly.
+
+### Automatic dataset overview
+
+The overview considers several eligible fields rather than defaulting to the first numeric column. It:
+
+- excludes constant, near-constant, identifier, and heavily missing fields;
+- ranks candidates using completeness, chart suitability, observed correlations, and outlier evidence;
+- selects up to five distinct analytical questions without padding with cosmetic alternatives;
+- supports categorical-only datasets through record counts;
+- labels the aggregation explicitly, using means for rates, prices, and unknown measurements, and sums for recognized additive measures;
+- retains non-additive categories instead of adding averages or distinct counts into an `other` bucket;
+- reports aggregation assumptions in chart notes for analyst review.
+
+The Recommendations page displays automatic overview charts only. After asking a separate question, use **Generate overview** to rebuild recommendations. Automatic generation is owned by the dashboard shell to avoid duplicate plan/execute requests.
+
+Accuracy regressions are in `tests/test_chart_accuracy.py`, including expected plotted values, deliberately corrupted groups, messy dates, missing values, and CSV upload-to-overview execution.
 
 ### Rule-Based Engine
 
